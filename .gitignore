@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+
+# Runtime state — never committed
+qwen-memory.db
+qwen-memory.db-shm
+qwen-memory.db-wal
+qwen-sessions/
+qwen-persona/
+sessions.json
+
+# Local environment
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

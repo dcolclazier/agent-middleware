@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code Middleware Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Header */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  header h1 { font-size: 14px; font-weight: 600; }
+  .health-badge {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: var(--green);
+    color: #000;
+  }
+  .health-badge.error { background: var(--red); }
+
+  /* Main layout */
+  main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    width: 280px;
+    min-width: 280px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+  }
+  .sidebar-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .btn-new {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: inherit;
+    font-weight: 600;
+  }
+  .session-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+  .session-item {
+    padding: 10px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 4px;
+    border: 1px solid transparent;
+  }
+  .session-item:hover { background: rgba(88,166,255,0.08); }
+  .session-item.active {
+    background: rgba(88,166,255,0.12);
+    border-color: var(--accent);
+  }
+  .session-item .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+  .status-running { background: var(--green); animation: pulse 1.5s infinite; }
+  .status-idle { background: var(--yellow); }
+  .status-complete { background: var(--purple); }
+  .status-error { background: var(--red); }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .session-item .goal {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .session-item .meta {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  /* Content area */
+  .content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .content-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .content-header h2 { font-size: 13px; font-weight: 500; }
+  .session-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .session-meta span { display: flex; align-items: center; gap: 4px; }
+
+  /* Log output */
+  .log-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 20px;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log-entry { padding: 2px 0; }
+  .log-entry.assistant { color: var(--text); }
+  .log-entry.system { color: var(--accent); }
+  .log-entry.tool { color: var(--text-dim); }
+  .log-entry.error { color: var(--red); }
+  .log-entry.stderr { color: var(--yellow); }
+  .log-entry .timestamp {
+    color: var(--text-dim);
+    font-size: 10px;
+    margin-right: 8px;
+  }
+
+  /* Message input */
+  .message-bar {
+    display: flex;
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    gap: 8px;
+  }
+  .message-bar input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    outline: none;
+  }
+  .message-bar input:focus { border-color: var(--accent); }
+  .message-bar button {
+    background: var(--accent);
+    color: #000;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .message-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-kill {
+    background: var(--red) !important;
+    color: #fff !important;
+  }
+
+  /* Empty state */
+  .empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  /* New session modal */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.visible { display: flex; }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    width: 600px;
+    max-width: 90vw;
+  }
+  .modal h3 { font-size: 14px; margin-bottom: 12px; }
+  .modal textarea {
+    width: 100%;
+    height: 200px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    resize: vertical;
+    outline: none;
+  }
+  .modal textarea:focus { border-color: var(--accent); }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .btn-cancel {
+    background: var(--border);
+    color: var(--text);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Claude Code Middleware Monitor</h1>
+  <span class="health-badge" id="health">checking...</span>
+</header>
+
+<main>
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <span>Sessions</span>
+      <button class="btn-new" onclick="showNewSession()">+ New</button>
+    </div>
+    <div class="session-list" id="sessionList"></div>
+  </div>
+
+  <div class="content" id="contentArea">
+    <div class="empty">Select a session or create a new one</div>
+  </div>
+</main>
+
+<!-- New Session Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h3>New Session</h3>
+    <textarea id="promptInput" placeholder="Enter prompt for Claude Code...
+Example: Run 50 NPC training iterations (always --n 1 each). Target avg_score > 9.5."></textarea>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="hideModal()">Cancel</button>
+      <button class="btn-new" onclick="submitNewSession()">Create Session</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let activeSessionId = null;
+let eventSource = null;
+
+// --- Auth header ---
+function headers() {
+  return { 'Content-Type': 'application/json' };
+}
+
+// --- Health check ---
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    const el = document.getElementById('health');
+    el.textContent = `${d.sessions.running} running / ${d.sessions.total} total`;
+    el.classList.remove('error');
+  } catch {
+    const el = document.getElementById('health');
+    el.textContent = 'offline';
+    el.classList.add('error');
+  }
+}
+
+// --- Session list ---
+async function refreshSessions() {
+  try {
+    const r = await fetch('/api/sessions', { headers: headers() });
+    const sessions = await r.json();
+    renderSessionList(sessions);
+  } catch {}
+}
+
+function renderSessionList(sessions) {
+  const el = document.getElementById('sessionList');
+  if (sessions.length === 0) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-dim);font-size:12px;text-align:center">No sessions yet</div>';
+    return;
+  }
+  el.innerHTML = sessions.map(s => `
+    <div class="session-item ${s.id === activeSessionId ? 'active' : ''}" onclick="selectSession('${s.id}')">
+      <div>
+        <span class="status-dot status-${s.status}"></span>
+        <span style="font-size:12px">${s.status}</span>
+        <span style="font-size:10px;color:var(--text-dim);margin-left:8px">${s.id.slice(0,8)}</span>
+      </div>
+      <div class="goal">${escHtml(s.goal.slice(0, 80))}</div>
+      <div class="meta">${new Date(s.createdAt).toLocaleTimeString()}${s.queuedMessages ? ` | ${s.queuedMessages} queued` : ''}</div>
+    </div>
+  `).join('');
+}
+
+// --- Select session ---
+async function selectSession(id) {
+  activeSessionId = id;
+
+  // Close existing SSE
+  if (eventSource) { eventSource.close(); eventSource = null; }
+
+  // Get current progress
+  const r = await fetch(`/api/sessions/${id}/progress`, { headers: headers() });
+  const p = await r.json();
+
+  renderContentArea(p);
+  connectSSE(id);
+  refreshSessions();
+}
+
+function renderContentArea(p) {
+  const area = document.getElementById('contentArea');
+  area.innerHTML = `
+    <div class="content-header">
+      <h2>${p.id.slice(0,8)}...</h2>
+      <div class="session-meta">
+        <span><span class="status-dot status-${p.status}"></span>${p.status}</span>
+        <span>Events: ${p.totalEvents}</span>
+        <span>Queued: ${p.queuedMessages}</span>
+        ${p.claudeSessionId ? `<span>Claude: ${p.claudeSessionId.slice(0,8)}</span>` : ''}
+      </div>
+    </div>
+    <div class="log-area" id="logArea"></div>
+    <div class="message-bar">
+      <input type="text" id="msgInput" placeholder="Send a message to this session..." onkeydown="if(event.key==='Enter')sendMsg()">
+      <button onclick="sendMsg()">Send</button>
+      <button class="btn-kill" onclick="killSess()">Kill</button>
+    </div>
+  `;
+
+  // Show last output as initial log entry
+  if (p.lastOutput) {
+    appendLog('assistant', p.lastOutput);
+  }
+  if (p.error) {
+    appendLog('error', p.error);
+  }
+}
+
+// --- SSE ---
+function connectSSE(id) {
+  eventSource = new EventSource(`/api/sessions/${id}/stream`);
+
+  eventSource.onmessage = (e) => {
+    try {
+      const event = JSON.parse(e.data);
+      handleStreamEvent(event);
+    } catch {}
+  };
+
+  eventSource.onerror = () => {
+    // Reconnect after 5s
+    setTimeout(() => {
+      if (activeSessionId === id) connectSSE(id);
+    }, 5000);
+  };
+}
+
+function handleStreamEvent(event) {
+  if (event.type === 'init') return; // Already handled
+
+  if (event.type === 'status_change') {
+    refreshSessions();
+    // Update status in header
+    const meta = document.querySelector('.session-meta');
+    if (meta) {
+      const dot = meta.querySelector('.status-dot');
+      if (dot) {
+        dot.className = `status-dot status-${event.status}`;
+        dot.nextSibling.textContent = event.status;
+      }
+    }
+    return;
+  }
+
+  if (event.type === 'stderr') {
+    appendLog('stderr', event.text);
+    return;
+  }
+
+  if (event.type === 'assistant' && event.message?.content) {
+    const texts = event.message.content
+      .filter(c => c.type === 'text' && c.text)
+      .map(c => c.text);
+    if (texts.length) appendLog('assistant', texts.join('\n'));
+    return;
+  }
+
+  if (event.type === 'result') {
+    if (event.result) appendLog('system', `Result: ${event.result.slice(0, 500)}`);
+    if (event.is_error) appendLog('error', `Error: ${event.result || 'unknown'}`);
+    refreshSessions();
+    return;
+  }
+
+  if (event.type === 'system') {
+    const msg = event.subtype === 'init'
+      ? `Session ${event.session_id?.slice(0,8)} initialized (model: ${event.model})`
+      : `System: ${event.subtype || JSON.stringify(event).slice(0, 200)}`;
+    appendLog('system', msg);
+    return;
+  }
+
+  // Tool events
+  if (event.type === 'tool_progress') {
+    appendLog('tool', `[${event.tool_name}] ${event.elapsed_time_seconds?.toFixed(1)}s`);
+    return;
+  }
+}
+
+function appendLog(cls, text) {
+  const area = document.getElementById('logArea');
+  if (!area) return;
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${cls}`;
+  const ts = new Date().toLocaleTimeString();
+  entry.innerHTML = `<span class="timestamp">${ts}</span>${escHtml(text)}`;
+  area.appendChild(entry);
+  area.scrollTop = area.scrollHeight;
+}
+
+// --- Actions ---
+async function sendMsg() {
+  const input = document.getElementById('msgInput');
+  if (!input || !input.value.trim() || !activeSessionId) return;
+  const msg = input.value.trim();
+  input.value = '';
+
+  appendLog('system', `You: ${msg}`);
+  try {
+    const r = await fetch(`/api/sessions/${activeSessionId}/message`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ message: msg }),
+    });
+    const d = await r.json();
+    if (d.queued) appendLog('system', '(queued - will deliver between iterations)');
+    refreshSessions();
+  } catch (err) {
+    appendLog('error', `Send failed: ${err.message}`);
+  }
+}
+
+async function killSess() {
+  if (!activeSessionId) return;
+  if (!confirm('Kill this session?')) return;
+  await fetch(`/api/sessions/${activeSessionId}/kill`, {
+    method: 'POST',
+    headers: headers(),
+  });
+  refreshSessions();
+}
+
+// --- New session modal ---
+function showNewSession() {
+  document.getElementById('modal').classList.add('visible');
+  document.getElementById('promptInput').focus();
+}
+
+function hideModal() {
+  document.getElementById('modal').classList.remove('visible');
+}
+
+async function submitNewSession() {
+  const prompt = document.getElementById('promptInput').value.trim();
+  if (!prompt) return;
+
+  try {
+    const r = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ prompt }),
+    });
+    const d = await r.json();
+    hideModal();
+    document.getElementById('promptInput').value = '';
+    await refreshSessions();
+    selectSession(d.id);
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// --- Init ---
+checkHealth();
+refreshSessions();
+setInterval(checkHealth, 10000);
+setInterval(refreshSessions, 5000);
+
+</script>
+</body>
+</html>

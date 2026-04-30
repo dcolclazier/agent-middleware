@@ -1,0 +1,40 @@
+{
+  "name": "agent-middleware",
+  "version": "0.1.0",
+  "description": "Discord bot + Claude/Qwen orchestrator. Bridges NemoClaw conversations to Claude Code sessions and routes Qwen-generated canon to git branches.",
+  "license": "UNLICENSED",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dcolclazier/agent-middleware.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "smoketest:overlay": "tsx scripts/test-overlay-budget.ts",
+    "smoketest:remember": "tsx scripts/test-remember.ts",
+    "smoketest:sentinel": "tsx scripts/test-sentinel-parser.ts",
+    "smoketest:truncation": "tsx scripts/test-truncation.ts",
+    "smoketest:qwen-tools": "tsx scripts/qwen-tool-smoketest.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/proper-lockfile": "^4.1.4",
+    "async-mutex": "^0.5.0",
+    "better-sqlite3": "^12.8.0",
+    "discord.js": "^14.26.2",
+    "express": "^5.1.0",
+    "js-tiktoken": "^1.0.21",
+    "openai": "^6.34.0",
+    "proper-lockfile": "^4.1.2",
+    "sqlite-vec": "^0.1.9"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
