@@ -27,6 +27,7 @@ import {
   type Agent,
 } from "./canon-commit.js";
 import { runQwenTurn, getQwenSession } from "./qwen-harness.js";
+import { loadPersona } from "./qwen-persona.js";
 
 // Load .env manually (no dotenv dependency)
 import { readFileSync } from "fs";
@@ -112,6 +113,20 @@ process.on("SIGINT", () => {
 
 // Restore persisted sessions before starting
 loadSessions();
+
+// Validate persona budget before any bot or HTTP listener starts. loadPersona()
+// throws if the combined SOUL.md/MEMORY.md/IDENTITY.md exceeds the persona
+// sub-budget (ADR-0003). Catching here routes through panicFlushAndExit so
+// the failure produces a clean [FATAL persona-startup] log + non-zero exit
+// rather than surfacing only when the first user message arrives.
+try {
+  await loadPersona();
+} catch (err) {
+  panicFlushAndExit("persona-startup", err, 1);
+  // panicFlushAndExit schedules process.exit on a 200ms timer; throw to
+  // halt this script's continued execution in the meantime.
+  throw err;
+}
 
 // Start both Discord bots in parallel (async — doesn't block server startup).
 // A failing Qwen startup (e.g. missing token, bad credentials) must never

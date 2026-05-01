@@ -13,11 +13,45 @@
  */
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { estimateTokens } from "./token-estimate.js";
 
 export interface Persona {
   identity: string;
   soul: string;
   memory: string;
+}
+
+// Persona sub-budget from ADR-0003. The combined identity + soul + memory
+// tokens must not exceed this; loadPersona() throws on overrun so the
+// middleware fails fast rather than serving silently inflated prompts.
+export const PERSONA_TOKEN_BUDGET = 1500;
+
+interface PersonaBudgetCheck {
+  ok: boolean;
+  total: number;
+  breakdown: { identity: number; soul: number; memory: number };
+}
+
+function checkPersonaBudget(persona: Persona): PersonaBudgetCheck {
+  const breakdown = {
+    identity: estimateTokens(persona.identity),
+    soul: estimateTokens(persona.soul),
+    memory: estimateTokens(persona.memory),
+  };
+  const total = breakdown.identity + breakdown.soul + breakdown.memory;
+  return { ok: total <= PERSONA_TOKEN_BUDGET, total, breakdown };
+}
+
+function formatBudgetError(c: PersonaBudgetCheck): string {
+  // Format is part of the contract — see scripts/test-persona-budget.ts
+  // and ADR-0003. Per-file breakdown is required so an operator can see
+  // which file to trim without re-running token estimates by hand.
+  return (
+    `persona over budget: ${c.total} tokens, max ${PERSONA_TOKEN_BUDGET}. ` +
+    `Trim SOUL.md/MEMORY.md/IDENTITY.md before retrying. ` +
+    `Per-file breakdown: SOUL.md=${c.breakdown.soul}, ` +
+    `MEMORY.md=${c.breakdown.memory}, IDENTITY.md=${c.breakdown.identity}.`
+  );
 }
 
 const PERSONA_DIR =
@@ -105,6 +139,22 @@ async function refreshIfStale(): Promise<void> {
   }
 
   const { persona, mtimes } = await readAll();
+  const check = checkPersonaBudget(persona);
+  if (!check.ok) {
+    // If _cache was populated, this is a reload (a previous load succeeded
+    // and we're refreshing because mtime changed). Log loudly with a
+    // distinct prefix so the supervisor's FATAL handler picks up the right
+    // context — the error itself still propagates so panicFlushAndExit
+    // exits non-zero. Without this log, an mtime-bumped over-budget edit
+    // would surface as a generic unhandledRejection rather than a clearly
+    // attributed persona problem.
+    if (_cache !== null) {
+      console.error(
+        `[FATAL persona] over budget post-reload: ${check.total} tokens`,
+      );
+    }
+    throw new Error(formatBudgetError(check));
+  }
   _cache = persona;
   _cachedMtimes = mtimes;
   console.log(`[qwen-persona] reloaded (${Object.keys(mtimes).length} files)`);
@@ -122,4 +172,21 @@ export function getPersonaSync(): Persona {
     );
   }
   return _cache;
+}
+
+// Test-only: reset module state. Smoke scripts call this between cases
+// because _cache / _cachedMtimes / _lastCheckAt are module-level. Not exported
+// from any production index — only used by scripts/test-persona-budget.ts.
+export function _resetCacheForTesting(): void {
+  _cache = null;
+  _cachedMtimes = {};
+  _lastCheckAt = 0;
+}
+
+// Test-only: drop the TTL freshness window so the next loadPersona() call
+// re-runs the mtime check. Preserves _cache and _cachedMtimes — used to
+// simulate a reload (vs. a first-load), which exercises a different code
+// path on budget overrun.
+export function _invalidateTtlForTesting(): void {
+  _lastCheckAt = 0;
 }
