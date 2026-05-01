@@ -7,6 +7,10 @@ import {
   type Message,
   type TextBasedChannel,
 } from "discord.js";
+import {
+  transcribeIncoming,
+  transcribeOutgoing,
+} from "./channel-transcript.js";
 
 // --- Types ---
 
@@ -512,6 +516,27 @@ export class BotInstance {
     return null;
   }
 
+  // --- Transcript capture helper ---
+
+  /**
+   * Fire-and-forget: record an outgoing reply in the channel transcript.
+   * Called from sendOrAttach / sendWithFiles after a successful send. The
+   * author is this BotInstance's displayName so readVerbatimWindow's
+   * exclude-by-author filter works the same way for both incoming and
+   * outgoing turns. No-op when MEMPALACE_ENABLED=false (handled inside
+   * the module).
+   */
+  private captureOutgoing(channel: TextBasedChannel, text: string): void {
+    const channelId = (channel as { id?: string }).id;
+    if (!channelId) return;
+    void transcribeOutgoing(
+      channelId,
+      this.displayName,
+      text,
+      new Date().toISOString(),
+    );
+  }
+
   // --- Discord helpers ---
 
   async safeReact(channelId: string, messageId: string, emoji: string): Promise<void> {
@@ -666,6 +691,7 @@ export class BotInstance {
 
     if (full.length <= MESSAGE_INLINE_MAX) {
       await (channel as TextChannel).send(full);
+      this.captureOutgoing(channel, text);
       return;
     }
 
@@ -732,6 +758,10 @@ export class BotInstance {
     }
 
     await (channel as TextChannel).send(out);
+    // Capture the FULL pre-truncation text — the transcript is for AGENT
+    // memory, not for what humans saw. Truncation is a Discord-display
+    // concern.
+    this.captureOutgoing(channel, text);
   }
 
   /**
@@ -806,6 +836,11 @@ export class BotInstance {
       (f) => new AttachmentBuilder(Buffer.from(f.content, "utf-8"), { name: f.name }),
     );
     await (channel as TextChannel).send({ content: inline, files: attachments });
+    // Transcript records the inline summary (the human-visible prose).
+    // Attachment file bodies are intentionally excluded; if a downstream
+    // agent needs an attachment's contents, it should re-fetch via the
+    // canon RAG / dcc layer rather than rehydrate megabytes from MemPalace.
+    this.captureOutgoing(channel, summary);
   }
 
   /**
@@ -964,6 +999,21 @@ export class BotInstance {
     if (this.allowedChannelIds && !this.allowedChannelIds.has(message.channel.id)) {
       return;
     }
+
+    // --- Channel transcript capture (slice #2) ---
+    // Persist every message we observe in a watched channel into the
+    // shared MemPalace conversation wing BEFORE the per-bot mention filter.
+    // The dedupe inside transcribeIncoming makes this idempotent across
+    // multiple BotInstances seeing the same MessageCreate event. No-op
+    // when MEMPALACE_ENABLED is not "true". Failures are swallowed inside
+    // the module; never block the bot reply path on transcript failure.
+    void transcribeIncoming(
+      message.channel.id,
+      message.id,
+      message.author.username,
+      message.content,
+      new Date(message.createdTimestamp).toISOString(),
+    );
 
     // STRICT: respond ONLY to (a) a proper user @mention, (b) a mention of one
     // of our configured mention-roles, or (c) a text-match against our

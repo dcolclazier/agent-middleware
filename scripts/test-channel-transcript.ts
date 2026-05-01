@@ -1,0 +1,493 @@
+// Smoke tests for src/channel-transcript.ts (Slice 2 — channel transcript foundation).
+// Run: npx tsx scripts/test-channel-transcript.ts
+//
+// The module under test exposes three async functions hiding the wing/room
+// conventions, eviction policy, and MemPalace failure handling:
+//   - writeTurn(channelId, author, text, timestamp): Promise<void>
+//   - readVerbatimWindow(channelId, excludeAuthor, k): Promise<TranscriptEntry[]>
+//   - searchProse(query, channelId?, limit): Promise<TranscriptEntry[]>
+//
+// We don't talk to a real MemPalace server here — the module exposes a
+// `_setBackendForTesting` hook (mirroring the test-state pattern PR #9
+// introduced for qwen-persona) that lets us substitute an in-memory backend.
+// The default backend wraps mempalace-client.ts; the in-memory backend is
+// only ever installed by this test script.
+
+import {
+  writeTurn,
+  readVerbatimWindow,
+  searchProse,
+  transcribeIncoming,
+  transcribeOutgoing,
+  CHANNEL_TRANSCRIPT_CAP,
+  CHANNEL_TRANSCRIPT_WING,
+  _setBackendForTesting,
+  _resetBackendForTesting,
+  _resetSeenIncomingForTesting,
+  type TranscriptBackend,
+  type TranscriptEntry,
+} from "../src/channel-transcript.js";
+
+let failed = 0;
+let passed = 0;
+
+function check(label: string, cond: boolean, detail?: string) {
+  if (cond) {
+    console.log(`  PASS  ${label}`);
+    passed++;
+  } else {
+    console.log(`  FAIL  ${label}${detail ? " — " + detail : ""}`);
+    failed++;
+  }
+}
+
+function sect(name: string) {
+  console.log(`\n--- ${name} ---`);
+}
+
+// ---------------------------------------------------------------------------
+// In-memory test backend. Mirrors the surface of the MemPalace client just
+// closely enough that the module under test can't tell the difference.
+// ---------------------------------------------------------------------------
+
+interface StoredDrawer {
+  id: string;
+  wing: string;
+  room: string;
+  content: string;
+  created_at: string;
+}
+
+function makeBackend(): TranscriptBackend & {
+  drawers: StoredDrawer[];
+  searchSpy: { query: string; wing?: string; room?: string; limit?: number }[];
+} {
+  const drawers: StoredDrawer[] = [];
+  const searchSpy: { query: string; wing?: string; room?: string; limit?: number }[] = [];
+  let counter = 0;
+  return {
+    drawers,
+    searchSpy,
+    async addDrawer(wing, room, content) {
+      counter++;
+      const id = `mock-${counter}`;
+      drawers.push({
+        id,
+        wing,
+        room,
+        content,
+        created_at: new Date().toISOString(),
+      });
+      return { success: true, drawer_id: id };
+    },
+    async listDrawers(opts) {
+      // Filter by wing/room when provided, return in insertion order.
+      let filtered = drawers.slice();
+      if (opts?.wing) filtered = filtered.filter((d) => d.wing === opts.wing);
+      if (opts?.room) filtered = filtered.filter((d) => d.room === opts.room);
+      const limit = opts?.limit ?? filtered.length;
+      const offset = opts?.offset ?? 0;
+      return filtered.slice(offset, offset + limit).map((d) => ({
+        id: d.id,
+        text: d.content,
+        wing: d.wing,
+        room: d.room,
+        created_at: d.created_at,
+      }));
+    },
+    async deleteDrawer(id) {
+      const idx = drawers.findIndex((d) => d.id === id);
+      if (idx === -1) return false;
+      drawers.splice(idx, 1);
+      return true;
+    },
+    async search(query, opts) {
+      searchSpy.push({
+        query,
+        wing: opts?.wing,
+        room: opts?.room,
+        limit: opts?.limit,
+      });
+      // Naive substring match for relevance assertions.
+      let filtered = drawers.slice();
+      if (opts?.wing) filtered = filtered.filter((d) => d.wing === opts.wing);
+      if (opts?.room) filtered = filtered.filter((d) => d.room === opts.room);
+      const matches = filtered.filter((d) =>
+        d.content.toLowerCase().includes(query.toLowerCase()),
+      );
+      const limit = opts?.limit ?? matches.length;
+      return matches.slice(0, limit).map((d) => ({
+        text: d.content,
+        wing: d.wing,
+        room: d.room,
+        similarity: 1.0,
+        distance: 0,
+        created_at: d.created_at,
+      }));
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const channel = "1234567890";
+  const otherChannel = "9876543210";
+
+  // Tests 1–6, 8 require MEMPALACE_ENABLED=true so the no-op path doesn't
+  // short-circuit the backend. Test 7 explicitly flips it to "false".
+  process.env.MEMPALACE_ENABLED = "true";
+
+  // 1. writeTurn writes one drawer with wing="conversation" and room=channelId.
+  sect("1. writeTurn — basic write");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    await writeTurn(channel, "Alice", "Hello world", "2026-04-30T12:00:00Z");
+    check("exactly one drawer was written", backend.drawers.length === 1);
+    check(
+      "wing is 'conversation'",
+      backend.drawers[0]?.wing === CHANNEL_TRANSCRIPT_WING,
+    );
+    check("room equals channelId", backend.drawers[0]?.room === channel);
+    const content = backend.drawers[0]?.content ?? "";
+    check("content carries author", content.includes("Alice"));
+    check(
+      "content carries timestamp",
+      content.includes("2026-04-30T12:00:00Z"),
+    );
+    check("content carries text", content.includes("Hello world"));
+    _resetBackendForTesting();
+  }
+
+  // 2. 500-cap eviction: 600 writes leave exactly 500 drawers, oldest evicted.
+  sect("2. eviction — 600 writes leave exactly 500 drawers");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    for (let i = 0; i < 600; i++) {
+      await writeTurn(
+        channel,
+        "Author" + i,
+        "msg " + i,
+        new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+      );
+    }
+    const transcriptDrawers = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    );
+    check(
+      `exactly ${CHANNEL_TRANSCRIPT_CAP} transcript drawers remain`,
+      transcriptDrawers.length === CHANNEL_TRANSCRIPT_CAP,
+      `actual=${transcriptDrawers.length}`,
+    );
+    // The first 100 messages must have been evicted; the newest 500 remain.
+    const first = transcriptDrawers[0]?.content ?? "";
+    const last =
+      transcriptDrawers[transcriptDrawers.length - 1]?.content ?? "";
+    check("oldest remaining drawer is msg 100", first.includes("msg 100"));
+    check("newest remaining drawer is msg 599", last.includes("msg 599"));
+    _resetBackendForTesting();
+  }
+
+  // 3. Layer B fact rooms are NOT subject to the cap.
+  sect("3. eviction — Layer B fact rooms unaffected");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // Pre-populate Layer B drawers (different wings/rooms — these belong to
+    // qwen-internal facts, not the conversation transcript). They MUST survive.
+    const factRooms = [
+      "decision",
+      "naming",
+      "user_preference",
+      "canon_observation",
+    ];
+    for (const room of factRooms) {
+      for (let i = 0; i < 3; i++) {
+        backend.drawers.push({
+          id: `fact-${room}-${i}`,
+          wing: "qwen",
+          room,
+          content: `[fact] ${room} ${i}`,
+          created_at: new Date().toISOString(),
+        });
+      }
+    }
+    const factDrawerIds = new Set(
+      backend.drawers
+        .filter((d) => d.wing === "qwen")
+        .map((d) => d.id),
+    );
+    // Now write 500 transcript drawers up to the cap.
+    for (let i = 0; i < 500; i++) {
+      await writeTurn(
+        channel,
+        "Author",
+        "transcript " + i,
+        new Date(Date.UTC(2026, 0, 1, 1, 0, i)).toISOString(),
+      );
+    }
+    // ...and one more, which should evict the OLDEST transcript only.
+    await writeTurn(
+      channel,
+      "Author",
+      "transcript 500",
+      new Date(Date.UTC(2026, 0, 1, 1, 30, 0)).toISOString(),
+    );
+    const remainingFacts = backend.drawers.filter((d) =>
+      factDrawerIds.has(d.id),
+    );
+    const remainingTranscripts = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    );
+    check(
+      `all ${factRooms.length * 3} Layer B fact drawers preserved`,
+      remainingFacts.length === factRooms.length * 3,
+      `actual=${remainingFacts.length}`,
+    );
+    check(
+      `exactly ${CHANNEL_TRANSCRIPT_CAP} transcript drawers remain`,
+      remainingTranscripts.length === CHANNEL_TRANSCRIPT_CAP,
+      `actual=${remainingTranscripts.length}`,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 4. Per-channel scope: writes to channel A do not evict channel B.
+  sect("4. eviction — per-channel scope");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // 100 messages in channel B
+    for (let i = 0; i < 100; i++) {
+      await writeTurn(
+        otherChannel,
+        "B",
+        "B msg " + i,
+        new Date(Date.UTC(2026, 0, 2, 0, 0, i)).toISOString(),
+      );
+    }
+    // 600 messages in channel A → only A is capped
+    for (let i = 0; i < 600; i++) {
+      await writeTurn(
+        channel,
+        "A",
+        "A msg " + i,
+        new Date(Date.UTC(2026, 0, 3, 0, 0, i)).toISOString(),
+      );
+    }
+    const aCount = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    ).length;
+    const bCount = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === otherChannel,
+    ).length;
+    check(`channel A capped at ${CHANNEL_TRANSCRIPT_CAP}`, aCount === CHANNEL_TRANSCRIPT_CAP);
+    check("channel B untouched (100 drawers)", bCount === 100);
+    _resetBackendForTesting();
+  }
+
+  // 5. readVerbatimWindow returns most-recent K, oldest-to-newest, excluding author.
+  sect("5. readVerbatimWindow — ordering + exclusion");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // Alternate authors so exclusion is observable.
+    const authors = ["Alice", "Bob", "Alice", "Carol", "Bob", "Alice", "Carol"];
+    for (let i = 0; i < authors.length; i++) {
+      await writeTurn(
+        channel,
+        authors[i]!,
+        `m${i}`,
+        new Date(Date.UTC(2026, 1, 1, 0, 0, i)).toISOString(),
+      );
+    }
+    // Read most recent 3 excluding Alice.
+    const window = await readVerbatimWindow(channel, "Alice", 3);
+    check("returned 3 entries", window.length === 3);
+    // Non-Alice messages in chronological order: m1 (Bob), m3 (Carol),
+    // m4 (Bob), m6 (Carol). Most-recent 3 of those are m3, m4, m6.
+    check(
+      "no Alice entries",
+      window.every((e: TranscriptEntry) => e.author !== "Alice"),
+    );
+    check(
+      "ordered oldest-to-newest by timestamp",
+      window.every(
+        (e, i) =>
+          i === 0 ||
+          new Date(e.timestamp).getTime() >=
+            new Date(window[i - 1]!.timestamp).getTime(),
+      ),
+    );
+    check("first entry is oldest of newest-3 non-Alice (m3)", window[0]?.text === "m3");
+    check("middle entry is m4", window[1]?.text === "m4");
+    check("last entry is newest non-Alice (m6)", window[2]?.text === "m6");
+    _resetBackendForTesting();
+  }
+
+  // 6. searchProse passes wing="conversation" and channel scope to the backend.
+  sect("6. searchProse — wing scope + optional channel");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    await writeTurn(channel, "Alice", "the quick brown fox", "2026-03-01T00:00:00Z");
+    await writeTurn(channel, "Bob", "lazy dog jumps", "2026-03-01T00:01:00Z");
+    await writeTurn(otherChannel, "Carol", "quick rabbit", "2026-03-01T00:02:00Z");
+
+    // Without channel scope: search the whole conversation wing.
+    const all = await searchProse("quick", undefined, 5);
+    const lastSearch = backend.searchSpy[backend.searchSpy.length - 1]!;
+    check("search wing is 'conversation'", lastSearch.wing === CHANNEL_TRANSCRIPT_WING);
+    check("search room undefined when channelId omitted", lastSearch.room === undefined);
+    check("returned 2 'quick' matches across both channels", all.length === 2);
+
+    // With channel scope: only this channel's matches.
+    const scoped = await searchProse("quick", channel, 5);
+    const scopedSearch = backend.searchSpy[backend.searchSpy.length - 1]!;
+    check("search room equals channelId when provided", scopedSearch.room === channel);
+    check("returned 1 'quick' match scoped to channel", scoped.length === 1);
+    check("scoped result is from correct channel", scoped[0]?.channelId === channel);
+    _resetBackendForTesting();
+  }
+
+  // 7. MEMPALACE_ENABLED=false → all calls are no-ops.
+  sect("7. flag-gated — no-op when MEMPALACE_ENABLED=false");
+  {
+    process.env.MEMPALACE_ENABLED = "false";
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    await writeTurn(channel, "X", "should not write", "2026-05-01T00:00:00Z");
+    check("writeTurn did not call backend", backend.drawers.length === 0);
+    const w = await readVerbatimWindow(channel, "Y", 5);
+    check("readVerbatimWindow returns []", Array.isArray(w) && w.length === 0);
+    const s = await searchProse("anything");
+    check("searchProse returns []", Array.isArray(s) && s.length === 0);
+    check("searchProse did not call backend.search", backend.searchSpy.length === 0);
+    _resetBackendForTesting();
+    // Restore for subsequent tests.
+    process.env.MEMPALACE_ENABLED = "true";
+  }
+
+  // 8. Backend errors are swallowed — writeTurn never throws.
+  sect("8. failure handling — backend errors swallowed");
+  {
+    _setBackendForTesting({
+      async addDrawer() {
+        throw new Error("backend exploded");
+      },
+      async listDrawers() {
+        throw new Error("backend exploded");
+      },
+      async deleteDrawer() {
+        return false;
+      },
+      async search() {
+        throw new Error("backend exploded");
+      },
+    });
+    let writeThrew = false;
+    try {
+      await writeTurn(channel, "A", "t", "2026-05-01T00:00:00Z");
+    } catch {
+      writeThrew = true;
+    }
+    check("writeTurn does not throw on backend failure", !writeThrew);
+
+    let readThrew = false;
+    let readVal: TranscriptEntry[] = [{ author: "x", text: "x", timestamp: "x", channelId: "x" }];
+    try {
+      readVal = await readVerbatimWindow(channel, "Y", 5);
+    } catch {
+      readThrew = true;
+    }
+    check("readVerbatimWindow does not throw", !readThrew);
+    check("readVerbatimWindow returns [] on failure", readVal.length === 0);
+
+    let searchThrew = false;
+    let searchVal: TranscriptEntry[] = [{ author: "x", text: "x", timestamp: "x", channelId: "x" }];
+    try {
+      searchVal = await searchProse("q", channel, 5);
+    } catch {
+      searchThrew = true;
+    }
+    check("searchProse does not throw", !searchThrew);
+    check("searchProse returns [] on failure", searchVal.length === 0);
+    _resetBackendForTesting();
+  }
+
+  // 9. transcribeIncoming dedupes on messageId across multiple BotInstances.
+  sect("9. transcribeIncoming — dedupe on messageId");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    _resetSeenIncomingForTesting();
+    // Two BotInstances in one process both call this for the same Discord
+    // MessageCreate event — only one drawer must be written.
+    await transcribeIncoming(
+      channel,
+      "msg-id-1",
+      "User",
+      "Hello there",
+      "2026-06-01T00:00:00Z",
+    );
+    await transcribeIncoming(
+      channel,
+      "msg-id-1",
+      "User",
+      "Hello there",
+      "2026-06-01T00:00:00Z",
+    );
+    await transcribeIncoming(
+      channel,
+      "msg-id-2",
+      "User",
+      "Another",
+      "2026-06-01T00:01:00Z",
+    );
+    check(
+      "exactly 2 drawers from 3 calls (one duplicate)",
+      backend.drawers.length === 2,
+      `actual=${backend.drawers.length}`,
+    );
+    _resetBackendForTesting();
+    _resetSeenIncomingForTesting();
+  }
+
+  // 10. transcribeOutgoing writes one drawer per call (no dedupe; bot layer
+  // controls when to send and is the sole caller per outbound message).
+  sect("10. transcribeOutgoing — one drawer per call");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    await transcribeOutgoing(
+      channel,
+      "ClaudeCode",
+      "Done.",
+      "2026-06-02T00:00:00Z",
+    );
+    await transcribeOutgoing(
+      channel,
+      "ClaudeCode",
+      "Standing by.",
+      "2026-06-02T00:00:30Z",
+    );
+    check("two drawers written", backend.drawers.length === 2);
+    check(
+      "both drawers carry the bot author",
+      backend.drawers.every((d) => d.content.includes("ClaudeCode")),
+    );
+    _resetBackendForTesting();
+  }
+
+  console.log(`\n======\n${passed} passed, ${failed} failed`);
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error("FAIL:", err);
+  process.exit(1);
+});
