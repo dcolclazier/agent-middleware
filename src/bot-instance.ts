@@ -203,27 +203,32 @@ export function evaluateTurnSize(
   // Bot author: clip the body to ~90% of TURN_BUDGET in token space.
   // estimateTokens isn't reversible, but cl100k_base on ASCII prose is
   // ~3.5 chars/token, so we approximate via char ratio and verify with a
-  // re-encode. If the first cut still overshoots, we iteratively scale the
-  // char budget down by 10% and re-check.
+  // re-encode. If the first cut still overshoots (including the trailing
+  // [truncated] marker we'll append), we iteratively scale the char budget
+  // down by 10% and re-check the FULL body — accounting for the marker
+  // inside the loop guarantees the returned `truncatedTokens` actually
+  // satisfies the targetTokens invariant rather than overshooting by the
+  // marker's token cost.
   const targetTokens = Math.floor(TURN_BUDGET * TURN_TRUNCATE_FRACTION);
   // First-cut char budget: scale down by the token ratio.
   let charBudget = Math.floor((body.length * targetTokens) / Math.max(tokens, 1));
   let truncated = body.slice(0, charBudget);
-  let truncatedTokens = estimateTokens(truncated);
-  // Walk down if still over (defensive — cl100k_base can run hot on dense
-  // structured content).
+  let truncatedBody = truncated + TURN_TRUNCATE_MARKER;
+  let truncatedTokens = estimateTokens(truncatedBody);
+  // Walk down if the FINAL emitted body (content + marker) is still over
+  // budget. cl100k_base can run hot on dense structured content.
   let safety = 16;
   while (truncatedTokens > targetTokens && safety-- > 0 && charBudget > 100) {
     charBudget = Math.floor(charBudget * 0.9);
     truncated = body.slice(0, charBudget);
-    truncatedTokens = estimateTokens(truncated);
+    truncatedBody = truncated + TURN_TRUNCATE_MARKER;
+    truncatedTokens = estimateTokens(truncatedBody);
   }
-  const truncatedBody = truncated + TURN_TRUNCATE_MARKER;
   return {
     kind: "truncate_bot",
     originalTokens: tokens,
     truncatedBody,
-    truncatedTokens: estimateTokens(truncatedBody),
+    truncatedTokens,
   };
 }
 
@@ -1307,7 +1312,25 @@ export class BotInstance {
         const name = remaining.slice("[ATTACHMENT: ".length, headerEnd);
         const contentStart = headerEnd + 2;
         const closingTag = "\n[/ATTACHMENT]";
-        const closeIndex = remaining.indexOf(closingTag, contentStart);
+        // Find a closing tag that's followed by an expected boundary —
+        // either `\n\n` (the prepend separator before the next attachment,
+        // the `[truncated]` marker, or any subsequent prose) or
+        // end-of-string. Attachment content can legitimately contain
+        // `\n[/ATTACHMENT]` (e.g. a markdown file documenting this
+        // framing); without the boundary check we'd mis-split there.
+        let closeIndex = -1;
+        let searchFrom = contentStart;
+        while (true) {
+          const candidate = remaining.indexOf(closingTag, searchFrom);
+          if (candidate === -1) break;
+          const after = candidate + closingTag.length;
+          if (after === remaining.length || remaining.startsWith("\n\n", after)) {
+            closeIndex = candidate;
+            break;
+          }
+          // Embedded close — keep looking.
+          searchFrom = candidate + 1;
+        }
         if (closeIndex === -1) {
           // Truncation cut mid-attachment: keep the partial content and
           // stop. The handler still gets a usable (if clipped) attachment
