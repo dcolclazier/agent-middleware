@@ -203,7 +203,8 @@ export function evaluateTurnSize(
   // Bot author: clip the body to ~90% of TURN_BUDGET in token space.
   // estimateTokens isn't reversible, but cl100k_base on ASCII prose is
   // ~3.5 chars/token, so we approximate via char ratio and verify with a
-  // re-encode. We binary-search down if the first cut still overshoots.
+  // re-encode. If the first cut still overshoots, we iteratively scale the
+  // char budget down by 10% and re-check.
   const targetTokens = Math.floor(TURN_BUDGET * TURN_TRUNCATE_FRACTION);
   // First-cut char budget: scale down by the token ratio.
   let charBudget = Math.floor((body.length * targetTokens) / Math.max(tokens, 1));
@@ -1077,10 +1078,16 @@ export class BotInstance {
     }
 
     if (decision.kind === "reject_human") {
+      // Derive the suggested-extensions list from ALLOWED_ATTACHMENT_EXTS so
+      // the user-facing reply can't drift from what readAttachments actually
+      // accepts when the allowlist evolves.
+      const allowedExtList = Array.from(ALLOWED_ATTACHMENT_EXTS)
+        .sort((a, b) => a.localeCompare(b))
+        .join("/");
       const reply =
         `Your message is ~${decision.tokens} tokens, over the per-turn cap of ${decision.limit}. ` +
         `Please chunk the message into smaller pieces, or attach the content as a file ` +
-        `(.md/.txt/.json/.yaml/.yml/.log/.csv).`;
+        `(${allowedExtList}).`;
       try {
         await (channel as TextChannel).send(reply);
       } catch (err) {
@@ -1282,15 +1289,58 @@ export class BotInstance {
       return;
     }
 
-    // Hand off to the per-bot handler. If we truncated the body, the
-    // truncated string already contains the (now-clipped) attachment
-    // blocks inline — pass an empty attachments array so the handler
-    // doesn't re-prepend the originals on top.
+    // Hand off to the per-bot handler while preserving the existing
+    // (content, attachments) split — even when the oversize policy
+    // truncated the combined body. Without this, ClaudeCode's directive
+    // detection (`reset:` / `catch up:` etc., see discord-bot.ts:claudeHandler)
+    // would run against a string starting with `[ATTACHMENT: ...]` markup
+    // and silently never match. Splitting the leading attachment blocks
+    // back out keeps the directive contract intact in the truncation path.
+    const splitLeadingAttachmentBlocks = (
+      body: string,
+    ): { content: string; attachments: typeof attachments } => {
+      let remaining = body;
+      const parsed: typeof attachments = [];
+      while (remaining.startsWith("[ATTACHMENT: ")) {
+        const headerEnd = remaining.indexOf("]\n");
+        if (headerEnd === -1) break;
+        const name = remaining.slice("[ATTACHMENT: ".length, headerEnd);
+        const contentStart = headerEnd + 2;
+        const closingTag = "\n[/ATTACHMENT]";
+        const closeIndex = remaining.indexOf(closingTag, contentStart);
+        if (closeIndex === -1) {
+          // Truncation cut mid-attachment: keep the partial content and
+          // stop. The handler still gets a usable (if clipped) attachment
+          // record instead of an unparsed sentinel block in `content`.
+          parsed.push({
+            name,
+            content: remaining.slice(contentStart).trimEnd(),
+          } as (typeof attachments)[number]);
+          remaining = "";
+          break;
+        }
+        parsed.push({
+          name,
+          content: remaining.slice(contentStart, closeIndex),
+        } as (typeof attachments)[number]);
+        remaining = remaining.slice(closeIndex + closingTag.length);
+        if (remaining.startsWith("\n\n")) remaining = remaining.slice(2);
+        else if (remaining.startsWith("\n")) remaining = remaining.slice(1);
+      }
+      return { content: remaining.trimStart(), attachments: parsed };
+    };
+
     let handlerContent = content;
     let handlerAttachments = attachments;
     if (policy.body !== composedBody) {
-      handlerContent = policy.body;
-      handlerAttachments = [];
+      if (attachments.length > 0) {
+        const split = splitLeadingAttachmentBlocks(policy.body);
+        handlerContent = split.content;
+        handlerAttachments = split.attachments;
+      } else {
+        handlerContent = policy.body;
+        handlerAttachments = [];
+      }
     }
 
     try {
