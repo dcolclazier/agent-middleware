@@ -557,6 +557,18 @@ app.post("/api/qwen/test", canonAuth, async (req, res) => {
   try {
     const result = await runQwenTurn(channelId, prompt);
     const session = await getQwenSession(channelId);
+    // ADR-0003: surface per-turn wire budget metrics for the request that
+    // was actually sent (post-compression, post-pre-flight). Defaults to
+    // 0 when the turn ended without any successful chat() call (e.g. a
+    // pre-error path).
+    const wb = result.wireBudget ?? {
+      systemPromptTokens: 0,
+      messagesTokens: 0,
+      overlayTokens: 0,
+      totalWireTokens: 0,
+      headroomToHardCap: 0,
+      headroomToSystemBudget: 0,
+    };
     res.json({
       sessionId: result.sessionId,
       finalText: result.finalText,
@@ -564,6 +576,14 @@ app.post("/api/qwen/test", canonAuth, async (req, res) => {
       turns: result.turns,
       messageCount: session ? session.messages.length : 0,
       toolFailures: session ? session.toolFailures : {},
+      systemPromptTokens: wb.systemPromptTokens,
+      messagesTokens: wb.messagesTokens,
+      totalWireTokens: wb.totalWireTokens,
+      headroomToHardCap: wb.headroomToHardCap,
+      headroomToSystemBudget: wb.headroomToSystemBudget,
+      // Optional structured error block (present iff stopReason==="error"
+      // due to wire-budget exceedance).
+      error: result.error,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
