@@ -20,6 +20,7 @@ import {
   BotInstance,
   TURN_BUDGET,
   evaluateTurnSize,
+  splitLeadingAttachmentBlocks,
 } from "../src/bot-instance.js";
 import { estimateTokens } from "../src/token-estimate.js";
 
@@ -310,6 +311,120 @@ sect("7. attachments included in size measurement");
     "human + huge attachment → reject_human (attachment counts)",
     d.kind === "reject_human",
   );
+}
+
+// -----------------------------------------------------------------------
+// 8. splitLeadingAttachmentBlocks — re-splitting the truncated body
+//    into (content, attachments) so the per-bot handler's invariant
+//    (directive detection runs on un-prepended content) survives the
+//    truncation path. Exercises the boundary check, mid-attachment
+//    truncation, and marker stripping.
+// -----------------------------------------------------------------------
+sect("8. splitLeadingAttachmentBlocks: clean two-attachment body");
+{
+  const body =
+    `[ATTACHMENT: a.md]\nalpha content\n[/ATTACHMENT]\n\n` +
+    `[ATTACHMENT: b.txt]\nbravo content\n[/ATTACHMENT]\n\n` +
+    `the prose lives here`;
+  const split = splitLeadingAttachmentBlocks(body);
+  check("returns 2 attachments", split.attachments.length === 2);
+  check("first attachment name", split.attachments[0]?.name === "a.md");
+  check(
+    "first attachment content (verbatim, no markers)",
+    split.attachments[0]?.content === "alpha content",
+  );
+  check("second attachment name", split.attachments[1]?.name === "b.txt");
+  check(
+    "second attachment content (verbatim)",
+    split.attachments[1]?.content === "bravo content",
+  );
+  check(
+    "trailing prose preserved",
+    split.content === "the prose lives here",
+  );
+}
+
+sect("9. splitLeadingAttachmentBlocks: no attachments → pass-through");
+{
+  const split = splitLeadingAttachmentBlocks("just some prose with no markers");
+  check("zero attachments", split.attachments.length === 0);
+  check(
+    "content equals input",
+    split.content === "just some prose with no markers",
+  );
+}
+
+sect("10. splitLeadingAttachmentBlocks: boundary check skips embedded close");
+{
+  // The attachment content itself contains "\n[/ATTACHMENT]" not followed
+  // by a "\n\n" or end-of-string boundary. The parser must skip it and
+  // find the REAL close that does have the boundary.
+  const body =
+    `[ATTACHMENT: doc.md]\n` +
+    `documenting the format: line ends with [/ATTACHMENT] tag here\n` +
+    `but the content continues here\n` +
+    `[/ATTACHMENT]\n\n` +
+    `prose tail`;
+  const split = splitLeadingAttachmentBlocks(body);
+  check("found exactly one attachment", split.attachments.length === 1);
+  check(
+    "attachment content includes the embedded false-positive line",
+    split.attachments[0]?.content.includes(
+      "documenting the format: line ends with [/ATTACHMENT] tag here",
+    ) ?? false,
+    `got: ${JSON.stringify(split.attachments[0]?.content?.slice(0, 200))}`,
+  );
+  check(
+    "attachment content includes the continuation line",
+    split.attachments[0]?.content.includes("but the content continues here") ??
+      false,
+  );
+  check("trailing prose extracted", split.content === "prose tail");
+}
+
+sect("11. splitLeadingAttachmentBlocks: truncation cut mid-attachment");
+{
+  // Simulate a truncated body that cut mid-attachment, with the
+  // TURN_TRUNCATE_MARKER appended to the whole. The marker MUST NOT end
+  // up inside attachment.content.
+  const body =
+    `[ATTACHMENT: huge.log]\n` +
+    `partial content that was cut off here` +
+    `\n\n[truncated]`;
+  const split = splitLeadingAttachmentBlocks(body);
+  check("one partial attachment recovered", split.attachments.length === 1);
+  check(
+    "partial attachment name preserved",
+    split.attachments[0]?.name === "huge.log",
+  );
+  check(
+    "marker NOT smuggled into attachment.content",
+    !(split.attachments[0]?.content.includes("[truncated]") ?? false),
+    `got: ${JSON.stringify(split.attachments[0]?.content?.slice(-60))}`,
+  );
+  check(
+    "partial content preserved up to the cut",
+    split.attachments[0]?.content === "partial content that was cut off here",
+  );
+  check(
+    "marker preserved as trailing content",
+    split.content.includes("[truncated]"),
+    `content: ${JSON.stringify(split.content)}`,
+  );
+}
+
+sect("12. splitLeadingAttachmentBlocks: end-of-string after close");
+{
+  // No trailing prose at all — body ends right after the last [/ATTACHMENT].
+  // The boundary check must accept end-of-string as a valid close.
+  const body = `[ATTACHMENT: only.md]\nlone attachment\n[/ATTACHMENT]`;
+  const split = splitLeadingAttachmentBlocks(body);
+  check("one attachment", split.attachments.length === 1);
+  check(
+    "attachment content extracted",
+    split.attachments[0]?.content === "lone attachment",
+  );
+  check("no trailing content", split.content === "");
 }
 
 // -----------------------------------------------------------------------

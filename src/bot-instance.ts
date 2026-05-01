@@ -232,6 +232,84 @@ export function evaluateTurnSize(
   };
 }
 
+/**
+ * Split leading `[ATTACHMENT: name]\n…\n[/ATTACHMENT]` blocks back out of a
+ * (possibly truncated) prompt body. Used by the oversize-turn policy when a
+ * bot message gets truncated: the prepend step folds attachments into the
+ * body for size measurement, but the per-bot handler expects (content,
+ * attachments) as a split tuple. Without this split, ClaudeCode's directive
+ * detection (see discord-bot.ts:claudeHandler — `reset:` / `catch up:` /
+ * etc.) would run against a string starting with `[ATTACHMENT: …]` markup
+ * and silently never match in the truncation path.
+ *
+ * Robustness:
+ * - Closing-tag boundary: only accept `\n[/ATTACHMENT]` followed by `\n\n`
+ *   (the prepend separator before the next block / `[truncated]` marker /
+ *   subsequent prose) or end-of-string. Attachment content can legitimately
+ *   contain `\n[/ATTACHMENT]` (e.g. a markdown file documenting this very
+ *   framing); embedded false-positive closes are skipped and the search
+ *   continues for a real boundary-flanked one.
+ * - Truncate-mid-attachment: when no boundary-flanked close exists, the cut
+ *   landed inside the attachment. We push a partial attachment with as much
+ *   content as we have. If the trailing TURN_TRUNCATE_MARKER got smuggled
+ *   into that partial content (it's appended to the whole body, so when the
+ *   cut is mid-attachment the marker ends up after the partial content),
+ *   strip it back out and keep it as trailing prose so it doesn't pollute
+ *   attachment.content.
+ *
+ * Exported for direct testing — see scripts/test-oversize-turn.ts.
+ */
+export function splitLeadingAttachmentBlocks(
+  body: string,
+): { content: string; attachments: ReadAttachment[] } {
+  let remaining = body;
+  const parsed: ReadAttachment[] = [];
+  while (remaining.startsWith("[ATTACHMENT: ")) {
+    const headerEnd = remaining.indexOf("]\n");
+    if (headerEnd === -1) break;
+    const name = remaining.slice("[ATTACHMENT: ".length, headerEnd);
+    const contentStart = headerEnd + 2;
+    const closingTag = "\n[/ATTACHMENT]";
+    let closeIndex = -1;
+    let searchFrom = contentStart;
+    while (true) {
+      const candidate = remaining.indexOf(closingTag, searchFrom);
+      if (candidate === -1) break;
+      const after = candidate + closingTag.length;
+      if (after === remaining.length || remaining.startsWith("\n\n", after)) {
+        closeIndex = candidate;
+        break;
+      }
+      // Embedded close that doesn't sit at a boundary — keep looking.
+      searchFrom = candidate + 1;
+    }
+    if (closeIndex === -1) {
+      // Truncation cut mid-attachment. Build the partial content from the
+      // header onward, then peel off the appended TURN_TRUNCATE_MARKER if
+      // it got rolled into the partial — leaving the marker inside an
+      // attachment body would mislead any downstream code that treats
+      // attachment.content as verbatim file content.
+      let partial = remaining.slice(contentStart);
+      let trailing = "";
+      if (partial.endsWith(TURN_TRUNCATE_MARKER)) {
+        partial = partial.slice(0, partial.length - TURN_TRUNCATE_MARKER.length);
+        trailing = TURN_TRUNCATE_MARKER.replace(/^\n+/, "");
+      }
+      parsed.push({ name, content: partial.trimEnd() });
+      remaining = trailing;
+      break;
+    }
+    parsed.push({
+      name,
+      content: remaining.slice(contentStart, closeIndex),
+    });
+    remaining = remaining.slice(closeIndex + closingTag.length);
+    if (remaining.startsWith("\n\n")) remaining = remaining.slice(2);
+    else if (remaining.startsWith("\n")) remaining = remaining.slice(1);
+  }
+  return { content: remaining.trimStart(), attachments: parsed };
+}
+
 // --- Outbound sentinel parser ---
 //
 // Claude Code CLI emits pure prose — it has no middleware-owned tool to
@@ -1094,7 +1172,15 @@ export class BotInstance {
         `Please chunk the message into smaller pieces, or attach the content as a file ` +
         `(${allowedExtList}).`;
       try {
-        await (channel as TextChannel).send(reply);
+        // allowedMentions: { parse: [] } neutralises any user/role/everyone
+        // pings that might be smuggled in via interpolation. tokens/limit
+        // here are integers and the ext list is a constant, so the current
+        // payload is safe — but we apply the defensive form for parity with
+        // the bot-truncate warning below, where authorName IS user-controlled.
+        await (channel as TextChannel).send({
+          content: reply,
+          allowedMentions: { parse: [] },
+        });
       } catch (err) {
         console.warn(
           `[${this.displayName}] oversized-turn reject reply failed: ${err}`,
@@ -1110,7 +1196,15 @@ export class BotInstance {
     const warning =
       `⚠ ${authorName} message truncated from ${decision.originalTokens} to ${decision.truncatedTokens} tokens`;
     try {
-      await (channel as TextChannel).send(warning);
+      // authorName is user-controlled (Discord username); a name containing
+      // "@everyone" / "@here" / `<@id>` / `<@&id>` would mass-mention or
+      // ping someone unintentionally. allowedMentions: { parse: [] }
+      // neutralises every mention type so this warning never pings anyone
+      // regardless of what the originating bot's name happens to be.
+      await (channel as TextChannel).send({
+        content: warning,
+        allowedMentions: { parse: [] },
+      });
     } catch (err) {
       console.warn(
         `[${this.displayName}] oversized-turn warning failed: ${err}`,
@@ -1299,60 +1393,8 @@ export class BotInstance {
     // truncated the combined body. Without this, ClaudeCode's directive
     // detection (`reset:` / `catch up:` etc., see discord-bot.ts:claudeHandler)
     // would run against a string starting with `[ATTACHMENT: ...]` markup
-    // and silently never match. Splitting the leading attachment blocks
-    // back out keeps the directive contract intact in the truncation path.
-    const splitLeadingAttachmentBlocks = (
-      body: string,
-    ): { content: string; attachments: typeof attachments } => {
-      let remaining = body;
-      const parsed: typeof attachments = [];
-      while (remaining.startsWith("[ATTACHMENT: ")) {
-        const headerEnd = remaining.indexOf("]\n");
-        if (headerEnd === -1) break;
-        const name = remaining.slice("[ATTACHMENT: ".length, headerEnd);
-        const contentStart = headerEnd + 2;
-        const closingTag = "\n[/ATTACHMENT]";
-        // Find a closing tag that's followed by an expected boundary —
-        // either `\n\n` (the prepend separator before the next attachment,
-        // the `[truncated]` marker, or any subsequent prose) or
-        // end-of-string. Attachment content can legitimately contain
-        // `\n[/ATTACHMENT]` (e.g. a markdown file documenting this
-        // framing); without the boundary check we'd mis-split there.
-        let closeIndex = -1;
-        let searchFrom = contentStart;
-        while (true) {
-          const candidate = remaining.indexOf(closingTag, searchFrom);
-          if (candidate === -1) break;
-          const after = candidate + closingTag.length;
-          if (after === remaining.length || remaining.startsWith("\n\n", after)) {
-            closeIndex = candidate;
-            break;
-          }
-          // Embedded close — keep looking.
-          searchFrom = candidate + 1;
-        }
-        if (closeIndex === -1) {
-          // Truncation cut mid-attachment: keep the partial content and
-          // stop. The handler still gets a usable (if clipped) attachment
-          // record instead of an unparsed sentinel block in `content`.
-          parsed.push({
-            name,
-            content: remaining.slice(contentStart).trimEnd(),
-          } as (typeof attachments)[number]);
-          remaining = "";
-          break;
-        }
-        parsed.push({
-          name,
-          content: remaining.slice(contentStart, closeIndex),
-        } as (typeof attachments)[number]);
-        remaining = remaining.slice(closeIndex + closingTag.length);
-        if (remaining.startsWith("\n\n")) remaining = remaining.slice(2);
-        else if (remaining.startsWith("\n")) remaining = remaining.slice(1);
-      }
-      return { content: remaining.trimStart(), attachments: parsed };
-    };
-
+    // and silently never match. The helper is module-level so smoke tests
+    // can exercise it directly — see splitLeadingAttachmentBlocks above.
     let handlerContent = content;
     let handlerAttachments = attachments;
     if (policy.body !== composedBody) {
