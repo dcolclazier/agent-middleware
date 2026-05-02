@@ -11,6 +11,8 @@ import {
   transcribeIncoming,
 } from "./channel-transcript.js";
 
+import { estimateTokens } from "./token-estimate.js";
+
 // --- Types ---
 
 export interface TriggerRef {
@@ -142,6 +144,186 @@ const OUTBOUND_MESSAGE_BYTE_CAP = 10_000_000;
 
 /** Max files in a single outbound message (harness contract; Discord allows up to 10). */
 const OUTBOUND_MAX_FILES_CAP = 5;
+
+// --- Oversized turn handling at the Discord routing layer ---
+//
+// Per-turn token budget enforced BEFORE the per-bot handler runs. Messages
+// over budget are either rejected (human author — ask them to chunk or attach)
+// or truncated-with-warning (bot author — keep the conversation flowing but
+// clip the body so vLLM doesn't 400). The asymmetry mirrors how
+// `parseThinkingCommand` only honours human authors.
+//
+// 22_000 from ADR-0003 (= WIRE_HARD_CAP − SYSTEM_BUDGET). src/qwen-harness.ts
+// re-derives and exports the same value under the same name. Dedupe is
+// intentionally deferred: the right fix is to lift WIRE_HARD_CAP /
+// SYSTEM_BUDGET / TURN_BUDGET into a shared constants module rather than
+// have the Discord routing layer import from a Qwen-specific module (that
+// would couple bot-instance.ts to Qwen's harness in the wrong direction).
+// Both sides agree on the value today; if ADR-0003's split changes, the
+// follow-up extraction is the place to keep them in sync.
+export const TURN_BUDGET = 22_000;
+
+/** When a bot author goes over budget, truncate to this fraction of TURN_BUDGET. */
+const TURN_TRUNCATE_FRACTION = 0.9;
+
+/** Trailing marker we append to truncated bodies before handing them to the handler. */
+const TURN_TRUNCATE_MARKER = "\n\n[truncated]";
+
+/**
+ * Decision returned by the pure size-evaluator. Exposed for testing — the
+ * routing layer's wiring method consumes the same enum.
+ */
+export type TurnSizeDecision =
+  | { kind: "ok" }
+  | { kind: "reject_human"; tokens: number; limit: number }
+  | {
+      kind: "truncate_bot";
+      originalTokens: number;
+      truncatedBody: string;
+      truncatedTokens: number;
+    };
+
+/**
+ * Pure decision function: given the (already-prepended) prompt body and
+ * whether the originating Discord author is a bot, decide what to do.
+ *
+ * Rules (issue #5):
+ *   - tokens ≤ TURN_BUDGET  →  `{ kind: "ok" }`
+ *   - human + over          →  reject (handler aborts, channel reply tells
+ *                              the user to chunk or attach the content)
+ *   - bot + over            →  truncate to ~90% of TURN_BUDGET, append a
+ *                              `[truncated]` marker, continue
+ *
+ * Token measurement uses the same `estimateTokens` helper as the rest of
+ * the harness so the cap stays consistent with downstream pre-flight checks.
+ */
+export function evaluateTurnSize(
+  body: string,
+  isBot: boolean,
+): TurnSizeDecision {
+  const tokens = estimateTokens(body);
+  if (tokens <= TURN_BUDGET) return { kind: "ok" };
+
+  if (!isBot) {
+    return { kind: "reject_human", tokens, limit: TURN_BUDGET };
+  }
+
+  // Bot author: clip the body to ~90% of TURN_BUDGET in token space.
+  // estimateTokens isn't reversible, but cl100k_base on ASCII prose is
+  // ~3.5 chars/token, so we approximate via char ratio and verify with a
+  // re-encode. If the first cut still overshoots (including the trailing
+  // [truncated] marker we'll append), we iteratively scale the char budget
+  // down by 10% and re-check the FULL body — accounting for the marker
+  // inside the loop guarantees the returned `truncatedTokens` actually
+  // satisfies the targetTokens invariant rather than overshooting by the
+  // marker's token cost.
+  const targetTokens = Math.floor(TURN_BUDGET * TURN_TRUNCATE_FRACTION);
+  // First-cut char budget: scale down by the token ratio.
+  let charBudget = Math.floor((body.length * targetTokens) / Math.max(tokens, 1));
+  let truncated = body.slice(0, charBudget);
+  let truncatedBody = truncated + TURN_TRUNCATE_MARKER;
+  let truncatedTokens = estimateTokens(truncatedBody);
+  // Walk down if the FINAL emitted body (content + marker) is still over
+  // budget. cl100k_base can run hot on dense structured content.
+  let safety = 16;
+  while (truncatedTokens > targetTokens && safety-- > 0 && charBudget > 100) {
+    charBudget = Math.floor(charBudget * 0.9);
+    truncated = body.slice(0, charBudget);
+    truncatedBody = truncated + TURN_TRUNCATE_MARKER;
+    truncatedTokens = estimateTokens(truncatedBody);
+  }
+  return {
+    kind: "truncate_bot",
+    originalTokens: tokens,
+    truncatedBody,
+    truncatedTokens,
+  };
+}
+
+/**
+ * Split leading `[ATTACHMENT: name]\n…\n[/ATTACHMENT]` blocks back out of a
+ * (possibly truncated) prompt body. Used by the oversize-turn policy when a
+ * bot message gets truncated: the prepend step folds attachments into the
+ * body for size measurement, but the per-bot handler expects (content,
+ * attachments) as a split tuple. Without this split, ClaudeCode's directive
+ * detection (see discord-bot.ts:claudeHandler — `reset:` / `catch up:` /
+ * etc.) would run against a string starting with `[ATTACHMENT: …]` markup
+ * and silently never match in the truncation path.
+ *
+ * Robustness:
+ * - Closing-tag boundary: only accept `\n[/ATTACHMENT]` followed by `\n\n`
+ *   (the prepend separator before the next block / `[truncated]` marker /
+ *   subsequent prose) or end-of-string. Attachment content can legitimately
+ *   contain `\n[/ATTACHMENT]` (e.g. a markdown file documenting this very
+ *   framing); embedded false-positive closes are skipped and the search
+ *   continues for a real boundary-flanked one.
+ * - Truncate-mid-attachment: when no boundary-flanked close exists, the cut
+ *   landed inside the attachment. We do NOT synthesise a parsed entry for
+ *   the partial — downstream renderers re-emit parsed attachments with a
+ *   `[/ATTACHMENT]` closing tag that was NOT in the truncated body, which
+ *   would push the handler-visible prompt past the cap evaluateTurnSize
+ *   already enforced. Instead the partial-attachment tail flows through as
+ *   plain `content` (cleanly-closed earlier attachments stay in `parsed`
+ *   because their original closing tags survived in the truncated body).
+ * - Byte-preservation: only the explicit `\n` / `\n\n` separators we know
+ *   were prepended get stripped. We never trim attachment content or the
+ *   final trailing prose — readAttachments preserves attachment content
+ *   verbatim, and downstream token estimation / directive parsing depends
+ *   on those bytes being unchanged.
+ *
+ * Exported for direct testing — see scripts/test-oversize-turn.ts.
+ */
+export function splitLeadingAttachmentBlocks(
+  body: string,
+): { content: string; attachments: ReadAttachment[] } {
+  let remaining = body;
+  const parsed: ReadAttachment[] = [];
+  while (remaining.startsWith("[ATTACHMENT: ")) {
+    const headerEnd = remaining.indexOf("]\n");
+    if (headerEnd === -1) break;
+    const name = remaining.slice("[ATTACHMENT: ".length, headerEnd);
+    const contentStart = headerEnd + 2;
+    const closingTag = "\n[/ATTACHMENT]";
+    let closeIndex = -1;
+    let searchFrom = contentStart;
+    while (true) {
+      const candidate = remaining.indexOf(closingTag, searchFrom);
+      if (candidate === -1) break;
+      const after = candidate + closingTag.length;
+      if (after === remaining.length || remaining.startsWith("\n\n", after)) {
+        closeIndex = candidate;
+        break;
+      }
+      // Embedded close that doesn't sit at a boundary — keep looking.
+      searchFrom = candidate + 1;
+    }
+    if (closeIndex === -1) {
+      // Truncation cut mid-attachment. Treat the rest as unsplittable: emit
+      // `remaining` (the partial `[ATTACHMENT: name]\n<partial-content>`
+      // tail, including any trailing `[truncated]` marker) as content. We
+      // deliberately don't synthesise a parsed entry — handlers re-render
+      // parsed attachments with a `[/ATTACHMENT]` closing tag that the
+      // budgeted body never contained, which would silently push the
+      // handler-visible prompt past evaluateTurnSize's targetTokens cap.
+      // Previously-closed attachments stay in `parsed` (their original
+      // closing tags survived intact in the truncated body, so re-emitting
+      // them doesn't add synthetic bytes).
+      return { content: remaining, attachments: parsed };
+    }
+    parsed.push({
+      name,
+      content: remaining.slice(contentStart, closeIndex),
+    });
+    remaining = remaining.slice(closeIndex + closingTag.length);
+    // Only strip the specific `\n` / `\n\n` separator we know was prepended
+    // to chain blocks together. Don't trim — readAttachments preserves
+    // content verbatim, so trailing prose may legitimately start with
+    // whitespace and downstream code is entitled to see it unchanged.
+    if (remaining.startsWith("\n\n")) remaining = remaining.slice(2);
+    else if (remaining.startsWith("\n")) remaining = remaining.slice(1);
+  }
+  return { content: remaining, attachments: parsed };
+}
 
 // --- Outbound sentinel parser ---
 //
@@ -989,6 +1171,102 @@ export class BotInstance {
     }
   }
 
+  /**
+   * Apply the issue-#5 oversized-turn policy to an inbound prompt body.
+   *
+   * Side effects on the channel:
+   *   - human + over → posts a one-line reply naming the limit and asking
+   *     for chunking or a file attachment; returns `{ abort: true }` so the
+   *     caller skips the per-bot handler.
+   *   - bot + over → posts a one-line warning identifying the originating
+   *     bot and the truncation length; returns `{ abort: false, body }` with
+   *     the truncated body (plus `[truncated]` marker) for the handler.
+   *   - under budget → no send; returns `{ abort: false, body }` unchanged.
+   *
+   * The body parameter is the FULL prompt the per-bot handler will see,
+   * including any prepended `[ATTACHMENT: …]` blocks. Attachments must NOT
+   * bypass the cap, so callers fold them in BEFORE calling this.
+   *
+   * Public so the smoke script can exercise the wiring side-effects against
+   * a stub channel without booting Discord.
+   */
+  async applyOversizeTurnPolicy(
+    channel: TextBasedChannel,
+    body: string,
+    isBot: boolean,
+    authorName: string,
+  ): Promise<{ abort: boolean; body: string }> {
+    const decision = evaluateTurnSize(body, isBot);
+    if (decision.kind === "ok") {
+      return { abort: false, body };
+    }
+
+    if (!("send" in channel)) {
+      // No way to surface the warning; degrade by aborting on human, passing
+      // through truncated body on bot. Logging keeps the operator informed.
+      console.warn(
+        `[${this.displayName}] oversized-turn policy: channel has no send(); decision=${decision.kind}`,
+      );
+      if (decision.kind === "reject_human") return { abort: true, body };
+      return { abort: false, body: decision.truncatedBody };
+    }
+
+    if (decision.kind === "reject_human") {
+      // Derive the suggested-extensions list from ALLOWED_ATTACHMENT_EXTS so
+      // the user-facing reply can't drift from what readAttachments actually
+      // accepts when the allowlist evolves.
+      const allowedExtList = Array.from(ALLOWED_ATTACHMENT_EXTS)
+        .sort((a, b) => a.localeCompare(b))
+        .join("/");
+      const reply =
+        `Your message is ~${decision.tokens} tokens, over the per-turn cap of ${decision.limit}. ` +
+        `Please chunk the message into smaller pieces, or attach the content as a file ` +
+        `(${allowedExtList}).`;
+      try {
+        // allowedMentions: { parse: [] } neutralises any user/role/everyone
+        // pings that might be smuggled in via interpolation. tokens/limit
+        // here are integers and the ext list is a constant, so the current
+        // payload is safe — but we apply the defensive form for parity with
+        // the bot-truncate warning below, where authorName IS user-controlled.
+        await (channel as TextChannel).send({
+          content: reply,
+          allowedMentions: { parse: [] },
+        });
+      } catch (err) {
+        console.warn(
+          `[${this.displayName}] oversized-turn reject reply failed: ${err}`,
+        );
+      }
+      console.log(
+        `[${this.displayName}] OVERSIZE-REJECT: ${authorName} sent ${decision.tokens} tokens (cap ${decision.limit})`,
+      );
+      return { abort: true, body };
+    }
+
+    // Bot + over: truncate, warn, continue.
+    const warning =
+      `⚠ ${authorName} message truncated from ${decision.originalTokens} to ${decision.truncatedTokens} tokens`;
+    try {
+      // authorName is user-controlled (Discord username); a name containing
+      // "@everyone" / "@here" / `<@id>` / `<@&id>` would mass-mention or
+      // ping someone unintentionally. allowedMentions: { parse: [] }
+      // neutralises every mention type so this warning never pings anyone
+      // regardless of what the originating bot's name happens to be.
+      await (channel as TextChannel).send({
+        content: warning,
+        allowedMentions: { parse: [] },
+      });
+    } catch (err) {
+      console.warn(
+        `[${this.displayName}] oversized-turn warning failed: ${err}`,
+      );
+    }
+    console.log(
+      `[${this.displayName}] OVERSIZE-TRUNCATE: ${authorName} ${decision.originalTokens}→${decision.truncatedTokens} tokens`,
+    );
+    return { abort: false, body: decision.truncatedBody };
+  }
+
   // --- Core message dispatch ---
 
   private async handleMessage(message: Message): Promise<void> {
@@ -1125,6 +1403,11 @@ export class BotInstance {
     if (priorChunks.length > 0) {
       content = priorChunks.join("\n\n") + "\n\n" + content;
       console.log(`[${this.displayName}] stitched ${priorChunks.length} prior chunks from ${message.author.username}`);
+      // Re-trim after stitching: priorChunks[0] can carry leading whitespace
+      // that survives the join. Keep the stitched content normalized here so
+      // size checks and the handler see the same post-stitch text, preventing
+      // leading/trailing whitespace from slipping past the cap.
+      content = content.trim();
     }
 
     if (!content) {
@@ -1154,8 +1437,55 @@ export class BotInstance {
       console.error(`[${this.displayName}] readAttachments failed: ${err}`);
     }
 
+    // --- Issue #5: oversized-turn policy at the Discord routing layer ---
+    // Compose the prompt the per-bot handler will see (mention-stripped
+    // content + any prepended [ATTACHMENT: ...] blocks) and run it through
+    // the size policy BEFORE invoking the handler. Attachments must NOT
+    // bypass the cap, so they go into the measurement here.
+    const attachmentBlock =
+      attachments.length > 0
+        ? attachments
+            .map((a) => `[ATTACHMENT: ${a.name}]\n${a.content}\n[/ATTACHMENT]`)
+            .join("\n\n") + "\n\n"
+        : "";
+    // No `.trim()` here: `content` was already trimmed (after mention-strip
+    // and again after priorChunks stitching), and `attachmentBlock` either
+    // ends with `\n\n` or is empty, so the composition has no leading or
+    // trailing whitespace. Trimming again would re-introduce the
+    // measurement / handler-input mismatch this trim discipline avoids.
+    const composedBody = attachmentBlock + content;
+    const policy = await this.applyOversizeTurnPolicy(
+      message.channel as TextBasedChannel,
+      composedBody,
+      message.author.bot,
+      message.author.username,
+    );
+    if (policy.abort) {
+      return;
+    }
+
+    // Hand off to the per-bot handler while preserving the existing
+    // (content, attachments) split — even when the oversize policy
+    // truncated the combined body. Without this, ClaudeCode's directive
+    // detection (`reset:` / `catch up:` etc., see discord-bot.ts:claudeHandler)
+    // would run against a string starting with `[ATTACHMENT: ...]` markup
+    // and silently never match. The helper is module-level so smoke tests
+    // can exercise it directly — see splitLeadingAttachmentBlocks above.
+    let handlerContent = content;
+    let handlerAttachments = attachments;
+    if (policy.body !== composedBody) {
+      if (attachments.length > 0) {
+        const split = splitLeadingAttachmentBlocks(policy.body);
+        handlerContent = split.content;
+        handlerAttachments = split.attachments;
+      } else {
+        handlerContent = policy.body;
+        handlerAttachments = [];
+      }
+    }
+
     try {
-      await this.handler(this, message, content, trigger, attachments);
+      await this.handler(this, message, handlerContent, trigger, handlerAttachments);
     } catch (err) {
       console.error(`[${this.displayName}] handler error: ${err}`);
     }

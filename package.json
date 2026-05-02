@@ -19,6 +19,7 @@
     "smoketest:truncation": "tsx scripts/test-truncation.ts",
     "smoketest:qwen-tools": "tsx scripts/qwen-tool-smoketest.ts",
     "smoketest:persona-budget": "tsx scripts/test-persona-budget.ts",
+    "smoketest:oversize-turn": "tsx scripts/test-oversize-turn.ts",
     "smoketest:channel-transcript": "tsx scripts/test-channel-transcript.ts"
   },
   "dependencies": {
