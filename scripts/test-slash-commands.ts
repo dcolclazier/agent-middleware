@@ -276,11 +276,12 @@ sect("10. boundary char does not leak into payload");
 }
 
 // ---------------------------------------------------------------------------
-// 11. Boundary excludes word-continuation chars (digits, underscore). With
-//     the looser [^a-z] form, `/end2end` would have parsed as /end with
-//     payload "end" — accidentally clearing the channel mapping.
+// 11. Boundary excludes ASCII word-continuation chars (digits, underscore).
+//     With the looser [^a-z] form, `/end2end` would have parsed as /end
+//     with payload "end" — accidentally clearing the channel mapping.
+//     Section #12 covers the Unicode-aware portion of the same boundary.
 // ---------------------------------------------------------------------------
-sect("11. boundary requires \\W (digits/underscore not allowed)");
+sect("11. boundary excludes ASCII digits/underscore");
 {
   check(
     "/end2 → null (digit is not a boundary)",
