@@ -98,14 +98,19 @@ const claudeHandler: BotMessageHandler = async (
     // its answer to the channel via the existing post-to-discord listener
     // and never overwrites the channel→Session mapping.
     //
-    // The trigger we register here is for the side session id, NOT the
-    // main session id — that way the existing status / post-to-discord
-    // listeners (which key on session id, not main-vs-side) emit
-    // 🧑‍💻 / 🔥 / 💥 / ✅ on the side-session's own /btw message.
+    // The trigger we register here binds to the side session id, NOT the
+    // main session id — that way the existing per-session status /
+    // post-to-discord listeners (which key on session id, not on a
+    // main-vs-side flag) emit 🧑‍💻 / 🔥 / 💥 / ✅ on the /btw message that
+    // triggered the spawn. The actual reply formatting (mention prefix,
+    // attachment sentinels, etc.) is whatever `BotInstance.postToDiscord`
+    // does for any session — side sessions get no special handling.
     //
-    // We swallow errors from enqueueSideTurn so a thrown promise rejection
-    // doesn't take down the message handler. Failures are visible via the
-    // 💥 reaction the existing status listener emits on session "error".
+    // We catch async failures from enqueueSideTurn so a thrown promise
+    // rejection doesn't take down the message handler; failures are
+    // surfaced via 💥 on the /btw message. The most likely failure modes
+    // are: (a) the per-channel queue cap being exceeded (a hostile client
+    // spamming /btw) and (b) `claude` spawn failure.
     enqueueSideTurn({
       channelId,
       payload: slash.payload,
