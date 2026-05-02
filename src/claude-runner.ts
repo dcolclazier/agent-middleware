@@ -27,6 +27,16 @@ export interface Session {
    * calls return their answer only to the Promise caller.
    */
   suppressDiscordPost?: boolean;
+  /**
+   * Set true by `cancelTurn` immediately before SIGTERM. The subprocess
+   * close handler consults this flag to short-circuit the normal "flush
+   * partial output → drain queue → emit status" sequence: a cancelled turn
+   * MUST NOT emit `post-to-discord` for whatever Claude was mid-saying, MUST
+   * NOT auto-resume, MUST NOT emit `error` status. Reset to undefined once
+   * the close handler has acknowledged it. See `cancelTurn` for the contract
+   * this enforces.
+   */
+  cancelled?: boolean;
 }
 
 interface StreamEvent {
@@ -121,6 +131,17 @@ export function loadSessions() {
 const CWD = process.env.CLAUDE_CWD || "/mnt/c/dev/dcc";
 const MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-6";
 const SESSION_TIMEOUT = 3_600_000; // 1 hour
+
+// `claude` binary path. Override with `CLAUDE_BIN` for installs where it's
+// not on PATH or for tests that want to substitute a stub. When the override
+// is itself a script runner (e.g. `node`), `CLAUDE_BIN_PREFIX_ARGS` is
+// inserted as the first argv element so we can wrap with e.g. a hang-forever
+// fixture in scripts/test-cancel-turn.ts without touching the runner's
+// existing argv-construction code paths.
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const CLAUDE_BIN_PREFIX_ARGS = process.env.CLAUDE_BIN_PREFIX_ARGS
+  ? [process.env.CLAUDE_BIN_PREFIX_ARGS]
+  : [];
 
 const CLAUDE_ARGS = [
   "--output-format", "stream-json",
@@ -220,6 +241,26 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
   });
 
   proc.on("close", (code) => {
+    // Cancellation short-circuit: cancelTurn() set `cancelled` immediately
+    // before SIGTERM. We MUST drop partial output, skip the queue drain,
+    // skip notifyNemoClaw (no `post-to-discord` for the cancelled turn),
+    // skip auto-resume, and land at status === "idle" with no error. The
+    // claudeSessionId set during this turn is preserved so the next user
+    // message resumes the same Claude conversation. The buffer of stream
+    // events is intentionally NOT flushed: a SIGTERMed claude CLI may emit
+    // a final assistant fragment that we'd otherwise notify on, exactly the
+    // behaviour cancelTurn exists to suppress. See test-cancel-turn.ts.
+    if (session.cancelled) {
+      session.process = null;
+      session.cancelled = undefined;
+      session.messageQueue = [];
+      session.status = "idle";
+      saveSessions();
+      sessionEvents.emit(`status:${session.id}`, session.status);
+      sessionEvents.emit("status", { sessionId: session.id, status: session.status });
+      return;
+    }
+
     // Flush remaining buffer
     if (buffer.trim()) {
       parseStreamLines(session, buffer + "\n");
@@ -280,10 +321,10 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
 
 function resumeWithPrompt(session: Session, prompt: string) {
   const args = session.claudeSessionId
-    ? ["-p", prompt, "--resume", session.claudeSessionId, ...CLAUDE_ARGS]
-    : ["-p", prompt, ...CLAUDE_ARGS];
+    ? [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, "--resume", session.claudeSessionId, ...CLAUDE_ARGS]
+    : [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, ...CLAUDE_ARGS];
 
-  const proc = spawn("claude", args, SPAWN_OPTS);
+  const proc = spawn(CLAUDE_BIN, args, SPAWN_OPTS);
 
   session.process = proc;
   session.status = "running";
@@ -303,7 +344,7 @@ export function createSession(
 ): Session {
   const id = crypto.randomUUID();
 
-  const proc = spawn("claude", ["-p", prompt, ...CLAUDE_ARGS], SPAWN_OPTS);
+  const proc = spawn(CLAUDE_BIN, [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, ...CLAUDE_ARGS], SPAWN_OPTS);
 
   const session: Session = {
     id,
@@ -467,6 +508,56 @@ export function killSession(id: string): boolean {
     session.process = null;
   }
   saveSessions();
+  return true;
+}
+
+/**
+ * Cancel the in-flight turn for a session WITHOUT destroying the session.
+ *
+ * This is the user-visible "Ctrl+C in the REPL" affordance — the analog of
+ * `/cancel` from a Discord channel (CONTEXT.md → /cancel). Distinct from
+ * `killSession`, which marks the session errored and is meant for
+ * destructive API consumers (`DELETE /api/sessions/:id`).
+ *
+ * Post-conditions on a running session:
+ *   - `process` is torn down (close handler will null it).
+ *   - `messageQueue` is drained (anything queued during the cancelled turn
+ *     is dropped on the floor — the user changed their mind).
+ *   - `status` ends at `idle` (NOT `error`).
+ *   - `claudeSessionId` is preserved so the next `sendMessage` resumes the
+ *     same Claude conversation via `--resume`.
+ *   - NO `post-to-discord` event is emitted for the cancelled turn — partial
+ *     output is discarded; the user expressly said "stop, don't reply."
+ *
+ * Returns:
+ *   - `true` if a running subprocess was torn down.
+ *   - `false` if the session doesn't exist or had no in-flight subprocess
+ *     (no-op caller is expected to react ⚠️).
+ *
+ * The actual idle/queue/status reset happens in the subprocess `close`
+ * handler (which observes `session.cancelled` and short-circuits the normal
+ * flush+drain path). We set the flag, send SIGTERM, and let the close
+ * handler land the post-conditions — that keeps the cancellation logic
+ * co-located with the rest of the lifecycle bookkeeping rather than racing
+ * the close handler from two places.
+ */
+export function cancelTurn(id: string): boolean {
+  const session = sessions.get(id);
+  if (!session) return false;
+  if (!session.process) return false;
+  // Drain the queue eagerly so no message slips through if SIGTERM is slow.
+  // The close handler will also drain, but doing it here is cheap insurance
+  // against a race where a sendMessage call lands after the SIGTERM but
+  // before the close handler runs.
+  session.messageQueue = [];
+  session.cancelled = true;
+  try {
+    session.process.kill("SIGTERM");
+  } catch {
+    // The process may have already exited. The cancelled flag still does
+    // the right thing if the close handler hasn't fired yet; if it already
+    // fired, we're past the point where we could observe state anyway.
+  }
   return true;
 }
 
