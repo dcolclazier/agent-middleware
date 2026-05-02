@@ -568,19 +568,31 @@ export function cancelTurn(id: string): boolean {
   const session = sessions.get(id);
   if (!session) return false;
   if (!session.process) return false;
-  // Drain the queue eagerly so no message slips through if SIGTERM is slow.
-  // The close handler will also drain, but doing it here is cheap insurance
-  // against a race where a sendMessage call lands after the SIGTERM but
-  // before the close handler runs.
+  // The process exited (close handler may not have fired yet, but it
+  // will): there's nothing to signal and nothing to cancel. Don't set
+  // `cancelled`; the natural completion path will run on close.
+  if (session.process.exitCode !== null) return false;
+
+  // Try to signal. If the kernel/Node refuses (process is gone between
+  // our exitCode check and kill call, or some platform-specific failure),
+  // treat it identically to exitCode-already-set: this isn't a cancel,
+  // it's a turn that finished on its own. Returning false makes the
+  // caller emit ⚠️ ("nothing to cancel") instead of 💀.
+  let signaled = false;
+  try {
+    signaled = session.process.kill("SIGTERM");
+  } catch {
+    signaled = false;
+  }
+  if (!signaled) return false;
+
+  // Signal accepted — the close handler will fire shortly and observe
+  // `cancelled`, short-circuiting through the cancel cleanup path.
+  // Drain the pre-cancel queue eagerly here so the close handler's
+  // post-cancel-drain logic can rely on "anything still in queue must
+  // have arrived after this point."
   session.messageQueue = [];
   session.cancelled = true;
-  try {
-    session.process.kill("SIGTERM");
-  } catch {
-    // The process may have already exited. The cancelled flag still does
-    // the right thing if the close handler hasn't fired yet; if it already
-    // fired, we're past the point where we could observe state anyway.
-  }
   return true;
 }
 
