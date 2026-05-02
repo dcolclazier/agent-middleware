@@ -21,9 +21,12 @@
  *    setting on the server. Adding one would require changes to the MemPalace
  *    server outside this repo's control. Client-side cap is the right
  *    trade-off for slice #2: transcript writes are infrequent (one per
- *    Discord message), the list+delete cost is bounded (≤501 drawers per
- *    channel even in the worst case), and it keeps the MemPalace contract
- *    unchanged. ADR-0004 (activity-bounded retention) governs this choice.
+ *    Discord message), and it keeps the MemPalace contract unchanged.
+ *    Cap-enforcement cost per writeTurn is bounded by `enforceCap`'s paged
+ *    loop: at most `ENFORCE_CAP_MAX_ITERATIONS` (5) list passes of up to
+ *    `CAP*2+1` (1001) drawers each, plus a delete per overflow drawer.
+ *    Steady-state (channel at-or-near cap) is one list + at most one delete.
+ *    ADR-0004 (activity-bounded retention) governs this choice.
  *
  * 3. Each drawer's content is a JSON envelope of {author, timestamp, text}.
  *    We do this rather than relying on MemPalace metadata because the list
@@ -444,26 +447,26 @@ export async function searchProse(
  * Discord MessageCreate events; without this dedupe, every message would be
  * written N times (once per BotInstance whose intents matched).
  *
- * Bounded so a long-running process can't grow this without limit.
+ * Backed by a single `Map` so `has` / `set` / oldest-eviction are all O(1)
+ * (Map iteration follows insertion order, so `keys().next().value` is the
+ * oldest entry). Bounded so a long-running process can't grow this without
+ * limit.
  */
 const SEEN_INCOMING_IDS_CAP = 5000;
-const seenIncomingIds = new Set<string>();
-const seenIncomingOrder: string[] = [];
+const seenIncoming = new Map<string, true>();
 
 function markSeen(messageId: string): boolean {
-  if (seenIncomingIds.has(messageId)) return false;
-  seenIncomingIds.add(messageId);
-  seenIncomingOrder.push(messageId);
-  while (seenIncomingOrder.length > SEEN_INCOMING_IDS_CAP) {
-    const evicted = seenIncomingOrder.shift();
-    if (evicted) seenIncomingIds.delete(evicted);
+  if (seenIncoming.has(messageId)) return false;
+  seenIncoming.set(messageId, true);
+  if (seenIncoming.size > SEEN_INCOMING_IDS_CAP) {
+    const oldest = seenIncoming.keys().next().value;
+    if (oldest !== undefined) seenIncoming.delete(oldest);
   }
   return true;
 }
 
 export function _resetSeenIncomingForTesting(): void {
-  seenIncomingIds.clear();
-  seenIncomingOrder.length = 0;
+  seenIncoming.clear();
 }
 
 /**
@@ -485,6 +488,10 @@ export async function transcribeIncoming(
   text: string,
   timestamp: string,
 ): Promise<void> {
+  // Flag check FIRST so the dedupe LRU is not mutated when the module is
+  // disabled — otherwise an id seen while disabled would be silently skipped
+  // when MemPalace later comes back online.
+  if (!isEnabled()) return;
   if (!markSeen(messageId)) return;
   await writeTurn(channelId, author, text, timestamp);
 }

@@ -879,6 +879,43 @@ async function main() {
     );
   }
 
+  // 19. transcribeIncoming respects MEMPALACE_ENABLED before mutating the
+  // dedupe LRU (Comment I). An id observed while disabled must remain
+  // eligible once MemPalace comes back online.
+  sect("19. transcribeIncoming — flag-gated before markSeen mutation");
+  {
+    process.env.MEMPALACE_ENABLED = "false";
+    _resetSeenIncomingForTesting();
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    await transcribeIncoming(
+      channel,
+      "rotates-id",
+      "U",
+      "first observation",
+      "2026-09-03T00:00:00Z",
+    );
+    check(
+      "no drawer written while disabled",
+      backend.drawers.length === 0,
+    );
+    process.env.MEMPALACE_ENABLED = "true";
+    await transcribeIncoming(
+      channel,
+      "rotates-id",
+      "U",
+      "later observation",
+      "2026-09-03T00:00:01Z",
+    );
+    check(
+      "after re-enable, the same id was captured (LRU not mutated while disabled)",
+      backend.drawers.length === 1,
+      `actual=${backend.drawers.length}`,
+    );
+    _resetBackendForTesting();
+    _resetSeenIncomingForTesting();
+  }
+
   console.log(`\n======\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }
