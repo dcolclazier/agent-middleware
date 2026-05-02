@@ -21,3 +21,4 @@ sessions.json
 .vscode/
 *.swp
 *.swo
+.claude
