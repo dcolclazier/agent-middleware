@@ -14,6 +14,7 @@ import {
   type ReadAttachment,
 } from "./bot-instance.js";
 import { parseSlashCommand } from "./slash-commands.js";
+import { enqueueSideTurn } from "./side-session.js";
 
 // --- Shared state across all bots in this process ---
 // Each BotInstance adds its own user id to this set on ClientReady so no
@@ -42,17 +43,17 @@ const claudeHandler: BotMessageHandler = async (
   // --- Channel slash-commands (CONTEXT.md → /btw, /cancel, /end) ---
   //
   // Detected BEFORE the existing reset: / catch up regex checks. The
-  // parser is first-token-only — `/cancel` and `/end` only match as the
-  // initial token of the post-mention-strip body, so prose that contains
-  // those words mid-sentence does not trigger them. `/end <payload>` and
-  // `/cancel <payload>` ARE matched (the verb-as-first-token rule); the
-  // payload is then ignored per CONTEXT.md → /end semantics. Recognition
-  // is the same whether or not the bot was @-mentioned, because
-  // BotInstance has already stripped the mention by the time we run.
+  // parser is first-token-only — `/cancel`, `/end`, and `/btw` only match
+  // as the initial token of the post-mention-strip body, so prose that
+  // contains those words mid-sentence does not trigger them. `/end
+  // <payload>` and `/cancel <payload>` ARE matched (the verb-as-first-
+  // token rule); each verb's dispatcher decides what to do with the
+  // payload (`/cancel` and `/end` ignore it; `/btw` feeds it into the
+  // side-session prompt). Recognition is the same whether or not the bot
+  // was @-mentioned, because BotInstance has already stripped the mention
+  // by the time we run.
   //
-  // Slice 1 (issue #14) wires /cancel and /end. /btw is recognised here
-  // but its dispatch is Slice 2 (issue #15) — for now we react 🤔 to ack
-  // the user and otherwise no-op.
+  // /cancel, /end, and /btw all dispatch from this branch (issues #14, #15).
   const slash = parseSlashCommand(content);
   if (slash) {
     const safeReact = async (emoji: string) => {
@@ -71,12 +72,14 @@ const claudeHandler: BotMessageHandler = async (
       return;
     }
     if (slash.verb === "/end") {
-      // /end ALWAYS reacts 👋 (even on an idle channel). cancelTurn is
-      // called unconditionally when there's a session — it returns false
-      // and is a no-op if nothing is in flight, which is fine. The
-      // Session record itself stays in sessions.json so it remains
-      // retrievable via the GET-by-id Sessions API; only the channel
-      // mapping is cleared.
+      // /end ALWAYS reacts 👋 and ALWAYS clears the channel mapping (even
+      // on an idle channel — clearSessionForChannel is a Map.delete and
+      // idempotent for unknown keys, so the unconditional call below
+      // matches the doc claim). When a session is in flight, also tear
+      // it down: cancelTurn is a no-op when nothing is running, but the
+      // explicit guard documents intent. The Session record itself stays
+      // in sessions.json so it remains retrievable via the GET-by-id
+      // Sessions API; only the channel mapping is cleared.
       //
       // Trigger is also cleared so a subsequently-resumed session via
       // POST /api/sessions/:id/message can't leak its post-to-discord
@@ -95,18 +98,62 @@ const claudeHandler: BotMessageHandler = async (
         cancelTurn(existingSessionId);
         const session = getSession(existingSessionId);
         if (session) session.suppressDiscordPost = true;
-        self.clearSessionForChannel(channelId);
         self.clearTrigger(existingSessionId);
       }
+      self.clearSessionForChannel(channelId);
       await safeReact("👋");
       return;
     }
-    // /btw — Slice 2 (issue #15) wires the side-session dispatch. For now
-    // we ack with 🤔 ("noticed your message") and otherwise no-op so we
-    // don't accidentally treat the /btw payload as a main-turn prompt.
-    // This matches the brief's "no-op or 'not yet' reaction is
-    // acceptable" allowance.
-    await safeReact("🤔");
+    // /btw — spawn an ephemeral side session that runs in parallel to the
+    // main turn. ADR-0005: fresh Claude session id (NOT a --resume of the
+    // main session). At most ONE in-flight side session per channel; a
+    // second /btw queues with ⏳ and drains FIFO. The side session posts
+    // its answer to the channel via the existing post-to-discord listener
+    // and never overwrites the channel→Session mapping.
+    //
+    // The trigger we register here binds to the side session id, NOT the
+    // main session id — that way the existing per-session status /
+    // post-to-discord listeners (which key on session id, not on a
+    // main-vs-side flag) emit 🧑‍💻 / 🔥 / 💥 / ✅ on the /btw message that
+    // triggered the spawn. The actual reply formatting (mention prefix,
+    // attachment sentinels, etc.) is whatever `BotInstance.postToDiscord`
+    // does for any session — side sessions get no special handling.
+    //
+    // We catch async failures from enqueueSideTurn so a thrown promise
+    // rejection doesn't take down the message handler; failures are
+    // surfaced via 💥 on the /btw message. The most likely failure modes
+    // are: (a) the per-channel queue cap being exceeded (a hostile client
+    // spamming /btw) and (b) `claude` spawn failure.
+    enqueueSideTurn({
+      channelId,
+      payload: slash.payload,
+      channelHistoryProvider: () => self.fetchChannelContext(channelId, message.id, 30),
+      mainSessionLookup: () => self.getSessionForChannel(channelId),
+      onAck: () => { void safeReact("🤔"); },
+      onQueued: () => { void safeReact("⏳"); },
+    })
+      .then((sideSessionId) => {
+        // Bind reactions/post-to-discord for THIS side session to the /btw
+        // message that triggered it. The trigger's authorIsBot flag drives
+        // whether postToDiscord prepends a mention reply — for /btw from a
+        // human, that's no mention; for /btw from a bot, it's an @reply.
+        self.setTrigger(sideSessionId, trigger);
+        // createSession emits `status:running` synchronously inside
+        // enqueueSideTurn — that fires BEFORE this .then() microtask, so the
+        // global status listener (which bails when no trigger is bound) misses
+        // the running transition and would otherwise skip 🧑‍💻 for /btw.
+        // Reconcile by sampling current status here. Subsequent transitions
+        // (complete / error) fire from the subprocess close handler, AFTER
+        // setTrigger has run, and land via the listener normally.
+        const sideSession = getSession(sideSessionId);
+        if (sideSession?.status === "running") {
+          void safeReact("🧑‍💻");
+        }
+      })
+      .catch((err) => {
+        console.error(`[ClaudeCode] /btw side-session dispatch failed: ${err}`);
+        void safeReact("💥");
+      });
     return;
   }
 

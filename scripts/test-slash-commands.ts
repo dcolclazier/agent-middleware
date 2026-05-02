@@ -2,11 +2,12 @@
 // Covers: parser precedence (first non-whitespace token only — prose with
 // the word "end" mid-sentence is NOT a command; prose that BEGINS with
 // `/end <anything>` IS the /end command, payload ignored per CONTEXT.md),
-// payload-after-verb extraction, recognition of the full /btw|/cancel|/end
-// family, mentioned/unmentioned equivalence (the parser runs on the
-// post-mention-strip body, so this test validates the body shape both
-// forms produce after BotInstance strips). See §5 for the /end-as-first-
-// token cases the parser intentionally matches.
+// payload-after-verb extraction (incl. leading-separator stripping and
+// internal-whitespace preservation for multi-line `/btw`), recognition of
+// the full /btw|/cancel|/end family, mentioned/unmentioned equivalence
+// (the parser runs on the post-mention-strip body, so this test validates
+// the body shape both forms produce after BotInstance strips). See §5 for
+// the /end-as-first-token cases the parser intentionally matches.
 //
 // Run: npx tsx scripts/test-slash-commands.ts
 //
@@ -75,9 +76,21 @@ sect("2. verb + payload");
   );
   const r2 = parseSlashCommand("/cancel    please");
   check(
-    "/cancel with multi-space payload (collapsed to one)",
+    "/cancel with leading-whitespace payload (leading trimmed)",
     r2?.verb === "/cancel" && r2?.payload === "please",
     `got ${JSON.stringify(r2)}`,
+  );
+  const r3 = parseSlashCommand("/btw line one\nline two\n\nline four");
+  check(
+    "/btw payload preserves internal newlines verbatim",
+    r3?.verb === "/btw" && r3?.payload === "line one\nline two\n\nline four",
+    `got ${JSON.stringify(r3)}`,
+  );
+  const r4 = parseSlashCommand("/btw multi  spaces  here");
+  check(
+    "/btw payload preserves multi-space runs verbatim",
+    r4?.verb === "/btw" && r4?.payload === "multi  spaces  here",
+    `got ${JSON.stringify(r4)}`,
   );
 }
 
@@ -122,8 +135,8 @@ sect("4. case-insensitive");
 // for ALL three verbs. The "false positive" pattern the brief is
 // protecting against is the verb appearing mid-prose (after other words),
 // which is far more common in conversation than someone literally
-// starting a message with `/end`. See REVIEW-NOTES.md for the deliberate
-// disagreement record if reviewers flag this.
+// starting a message with `/end`. The `/end <anything>` shape is
+// dispatched by /end's handler, which ignores its payload.
 // ---------------------------------------------------------------------------
 sect("5. no false-positives on prose");
 {
@@ -172,6 +185,25 @@ sect("6. verb must be word-bounded");
     "/btwthing is not /btw",
     parseSlashCommand("/btwthing question") === null,
   );
+  // Digits and underscores are not valid verb boundaries either — `/end2`
+  // and `/cancel_all` must NOT silently parse as `/end` with payload `"2"`
+  // or `/cancel` with payload `"_all"`.
+  check(
+    "/end2 is not /end (digit boundary)",
+    parseSlashCommand("/end2 of file") === null,
+  );
+  check(
+    "/cancel123 is not /cancel (digit boundary)",
+    parseSlashCommand("/cancel123") === null,
+  );
+  check(
+    "/btw9 is not /btw (digit boundary)",
+    parseSlashCommand("/btw9 question") === null,
+  );
+  check(
+    "/cancel_all is not /cancel (underscore boundary)",
+    parseSlashCommand("/cancel_all now") === null,
+  );
   // But verb followed by punctuation IS allowed.
   check(
     "/cancel: please",
@@ -180,6 +212,23 @@ sect("6. verb must be word-bounded");
   check(
     "/end. please",
     parseSlashCommand("/end. please")?.verb === "/end",
+  );
+  // Leading separator punctuation between verb and payload is consumed,
+  // so `/btw: question` and `/btw, question` both yield payload "question".
+  check(
+    "/btw: question payload strips colon separator",
+    parseSlashCommand("/btw: question")?.payload === "question",
+    `got ${JSON.stringify(parseSlashCommand("/btw: question"))}`,
+  );
+  check(
+    "/btw, question payload strips comma separator",
+    parseSlashCommand("/btw, question")?.payload === "question",
+    `got ${JSON.stringify(parseSlashCommand("/btw, question"))}`,
+  );
+  check(
+    "/btw:hello payload strips colon (no whitespace)",
+    parseSlashCommand("/btw:hello")?.payload === "hello",
+    `got ${JSON.stringify(parseSlashCommand("/btw:hello"))}`,
   );
 }
 

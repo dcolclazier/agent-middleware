@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -37,6 +37,21 @@ export interface Session {
    * acknowledged it. See `cancelTurn` for the contract this enforces.
    */
   cancelled?: boolean;
+  /**
+   * When true, this session is NEVER written to `sessions.json`
+   * (`saveSessions` skips it). Used by `/btw` side sessions per ADR-0005 —
+   * the side session is single-turn and intentionally has no persistence
+   * footprint. The post-to-discord event still fires so the channel reply
+   * lands; only persistence changes.
+   *
+   * Lifetime: the Session record stays in the in-memory `sessions` map for
+   * the rest of the process lifetime (bounded by `/btw` traffic; cleared
+   * at the next restart). A future slice can add an explicit map sweep on
+   * terminal status if `/btw` traffic grows enough that retained
+   * `outputBuffer` arrays show up in heap profiles. Aligned with the
+   * matching note in `src/side-session.ts`.
+   */
+  ephemeral?: boolean;
 }
 
 interface StreamEvent {
@@ -83,8 +98,23 @@ interface PersistedSession {
   callbackSessionKey: string | null;
 }
 
+// Cache of the last-written serialized payload. `saveSessions()` is called
+// on every session-state transition, including lifecycle events for
+// ephemeral sessions that are filtered out of the persisted output. Without
+// this cache, /btw bursts at the 5 msg/sec Discord rate would produce ~3
+// redundant writes per /btw with identical content. Comparing the payload
+// to lastSerialized lets us skip the writeFileSync when nothing persistent
+// changed, with no semantic change to callers.
+let lastSerialized: string | null = null;
+
 export function saveSessions() {
-  const data: PersistedSession[] = Array.from(sessions.values()).map((s) => ({
+  // Ephemeral sessions (e.g. /btw side sessions) are intentionally excluded
+  // from persistence — they are single-turn and discarded on terminal
+  // status, so leaving them in sessions.json would leak state across
+  // restarts for sessions whose subprocess no longer exists. See ADR-0005.
+  const data: PersistedSession[] = Array.from(sessions.values())
+    .filter((s) => !s.ephemeral)
+    .map((s) => ({
     id: s.id,
     claudeSessionId: s.claudeSessionId,
     status: s.process ? "running" as const : s.status,  // if process alive, mark running; otherwise keep status
@@ -95,8 +125,15 @@ export function saveSessions() {
     error: s.error,
     callbackSessionKey: s.callbackSessionKey,
   }));
+  const serialized = JSON.stringify(data, null, 2);
+  // Skip the write only when content matches AND the file is still on disk —
+  // if it was externally truncated/deleted (manual `rm`, a botched copy,
+  // etc.), we need to recreate it on the next call rather than silently
+  // returning early forever.
+  if (serialized === lastSerialized && existsSync(SESSIONS_FILE)) return;
   try {
-    writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    writeFileSync(SESSIONS_FILE, serialized);
+    lastSerialized = serialized;
   } catch (err) {
     console.error(`Failed to save sessions: ${err}`);
   }
@@ -370,7 +407,7 @@ export function createSession(
   autoResume = false,
   webhook = false,
   callbackSessionKey: string | null = null,
-  opts: { suppressDiscordPost?: boolean } = {},
+  opts: { suppressDiscordPost?: boolean; ephemeral?: boolean } = {},
 ): Session {
   const id = crypto.randomUUID();
 
@@ -392,6 +429,7 @@ export function createSession(
     webhook,
     callbackSessionKey,
     suppressDiscordPost: opts.suppressDiscordPost === true,
+    ephemeral: opts.ephemeral === true,
   };
 
   attachProcessHandlers(session, proc);

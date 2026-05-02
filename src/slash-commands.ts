@@ -27,7 +27,14 @@ export type SlashVerb = "/btw" | "/cancel" | "/end";
 
 export interface SlashCommand {
   verb: SlashVerb;
-  /** Everything after the verb, leading/trailing whitespace stripped, internal whitespace collapsed to single spaces. */
+  /**
+   * Everything after the verb's boundary char (which is consumed by the
+   * regex), with leading separators (whitespace and the common verb→payload
+   * punctuation `:` `,` `;` `.`) and trailing whitespace stripped. Internal
+   * whitespace (including newlines) is preserved verbatim so multi-line
+   * `/btw` payloads keep their formatting (`/btw` is the slice-2 consumer
+   * of payload — see ADR-0005; `/cancel` and `/end` ignore their payloads).
+   */
   payload: string;
 }
 
@@ -79,10 +86,15 @@ export function parseSlashCommand(content: string): SlashCommand | null {
   if (!KNOWN_VERBS.has(verb)) return null;
 
   // Group 2 is everything AFTER the boundary char (which the regex
-  // consumed). Collapse runs of internal whitespace and trim so the
-  // payload is normalized — e.g. `/btw    what    now` → "what now".
+  // consumed). Strip leading separators — whitespace plus the common
+  // verb→payload punctuation `:` `,` `;` `.` — so `/btw:: hello` yields
+  // payload `"hello"` (the regex consumes one ":", we strip the rest).
+  // Internal whitespace (including newlines) is preserved verbatim so
+  // multi-line `/btw` payloads keep their formatting (collapsing newlines
+  // would silently destroy structure in code blocks, lists, etc.).
+  // Trailing whitespace is trimmed.
   const rawPayload = m[2] ?? "";
-  const payload = rawPayload.replace(/\s+/g, " ").trim();
+  const payload = rawPayload.replace(/^[\s:.,;]+/, "").trimEnd();
 
   return { verb: verb as SlashVerb, payload };
 }
