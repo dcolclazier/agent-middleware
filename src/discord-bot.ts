@@ -77,9 +77,15 @@ const claudeHandler: BotMessageHandler = async (
       // Session record itself stays in sessions.json so it remains
       // retrievable via the GET-by-id Sessions API; only the channel
       // mapping is cleared.
+      //
+      // Trigger is also cleared so a subsequently-resumed session via
+      // POST /api/sessions/:id/message can't leak its post-to-discord
+      // back to this channel via the sessionTriggers lookup path. After
+      // /end the channel must be fully dissociated.
       if (existingSessionId) {
         cancelTurn(existingSessionId);
         self.clearSessionForChannel(channelId);
+        self.clearTrigger(existingSessionId);
       }
       await safeReact("👋");
       return;

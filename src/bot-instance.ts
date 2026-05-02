@@ -546,6 +546,19 @@ export class BotInstance {
     return this.sessionTriggers.get(sessionId);
   }
 
+  /**
+   * Forget the trigger for a session.
+   *
+   * Called from /end so a subsequently-resumed session (e.g. via
+   * `POST /api/sessions/:id/message`) doesn't leak its post-to-discord
+   * back to the previously-associated channel via the trigger lookup
+   * path. The Session record itself is preserved (per CONTEXT.md →
+   * /end); only the channel-association sticker is removed.
+   */
+  clearTrigger(sessionId: string): void {
+    this.sessionTriggers.delete(sessionId);
+  }
+
   getChannelForSession(sessionId: string): string | null {
     const trigger = this.sessionTriggers.get(sessionId);
     if (trigger) return trigger.channelId;
