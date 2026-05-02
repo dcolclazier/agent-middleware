@@ -28,7 +28,8 @@
 
 import { writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // --- Test harness setup ---
 
@@ -73,9 +74,11 @@ const { createSession, sendMessage, getSession, sessionEvents } = runner;
 const { enqueueSideTurn, seedSidePrompt, _resetSideSessionStateForTests } = sideSessionMod;
 
 // SESSIONS_FILE lives next to the runner module (../sessions.json relative
-// to dist; via tsx, relative to src/). Compute the same path the runner uses.
+// to dist; via tsx, relative to src/). Compute the same path the runner uses
+// — `fileURLToPath` is required for Windows correctness (`URL.pathname`
+// returns `/C:/...` with a leading slash and URL-escaped chars).
 const SESSIONS_FILE = join(
-  new URL(".", import.meta.url).pathname,
+  dirname(fileURLToPath(import.meta.url)),
   "..",
   "sessions.json",
 );
