@@ -390,8 +390,13 @@ function hasStandbySentinel(content: string): boolean {
 //
 //   👀  message received and is being processed
 //        emitter: BotInstance.handleMessage (this file)
-//   ✅  acknowledged (kill-switch enable; standby-sentinel ack;
-//        post-to-discord landed for a session's final text)
+//   ✅  acknowledged (three distinct emit sites):
+//          - kill-switch enable command processed
+//          - standby-sentinel observed in a session reply
+//          - session's final text is ready and is being posted to the
+//            channel (fired on the trigger message just BEFORE
+//            postToDiscord delivers the reply, not after — the post
+//            itself can still fail asynchronously)
 //        emitter: BotInstance.handleMessage; discord-bot.ts
 //   🛑  bot disabled by user kill-switch command
 //        emitter: BotInstance.handleMessage
