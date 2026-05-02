@@ -1383,6 +1383,89 @@ async function main() {
     _resetBackendForTesting();
   }
 
+  // 28. Memory-offline warning — notifier-throws does NOT poison the flag.
+  // Regression: if the notifier throws synchronously or its returned promise
+  // rejects (Discord outage / missing permissions), no notice was posted,
+  // so the next MemPalace failure on that channel must retry posting rather
+  // than be silenced by a flag set in advance.
+  sect("28. memory-offline warning — notifier-throws does not poison flag");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+
+    // Phase 1: synchronous throw. Notifier raises; no notice posted.
+    let invoked = 0;
+    setMemoryOfflineNotifier(() => {
+      invoked++;
+      throw new Error("discord down");
+    });
+    await writeTurn(channel, "A", "first", "2027-01-01T00:00:00Z");
+    check(
+      "throwing notifier was invoked on first failure",
+      invoked === 1,
+      `invoked=${invoked}`,
+    );
+
+    // Phase 2: subsequent failure on same channel — notifier must run again,
+    // because the previous attempt rolled back the flag.
+    await writeTurn(channel, "A", "second", "2027-01-01T00:00:01Z");
+    check(
+      "throwing notifier is invoked again after a prior throw",
+      invoked === 2,
+      `invoked=${invoked}`,
+    );
+
+    // Phase 3: switch to a healthy notifier; next failure must fire warning.
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    await writeTurn(channel, "A", "third", "2027-01-01T00:00:02Z");
+    check(
+      "healthy notifier fires after prior throws unblocked the channel",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+
+    // Phase 4: async rejection. Returned promise rejects → flag should clear.
+    _resetMemoryOfflineStateForTesting();
+    let asyncInvoked = 0;
+    setMemoryOfflineNotifier(async () => {
+      asyncInvoked++;
+      throw new Error("discord rejected");
+    });
+    await writeTurn(channel, "A", "async-1", "2027-01-01T00:01:00Z");
+    // Yield to let the rejected promise's catch handler clear the flag.
+    await new Promise((r) => setTimeout(r, 10));
+    await writeTurn(channel, "A", "async-2", "2027-01-01T00:01:01Z");
+    check(
+      "async-rejecting notifier retries on next failure",
+      asyncInvoked === 2,
+      `asyncInvoked=${asyncInvoked}`,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
   console.log(`\n======\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }

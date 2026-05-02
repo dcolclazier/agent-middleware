@@ -228,15 +228,21 @@ function reportMpFailure(channelId: string, reason: string): void {
   if (memoryOfflineWarned.get(channelId) === true) return;
   const notifier = memoryOfflineNotifier;
   if (!notifier) return;
-  // Mark warned only when we actually attempt to notify. Setting the flag
-  // unconditionally would let a failure in a non-Discord context (e.g. an
-  // HTTP route hitting writeTurn before bot wiring) permanently suppress the
-  // first postable warning until a MemPalace success clears it.
+  // Mark warned only when we actually attempt to notify, and roll the flag
+  // back if the attempt fails. Setting it unconditionally would let two
+  // failure modes permanently suppress later warnings until a MemPalace
+  // success clears the flag:
+  //   (a) failure in a non-Discord context (e.g. HTTP route hits writeTurn
+  //       before bot wiring sets the notifier),
+  //   (b) the notifier itself throws/rejects (Discord outage, missing
+  //       permissions in the channel) — no notice was posted, so the next
+  //       MemPalace failure should retry posting.
   memoryOfflineWarned.set(channelId, true);
   try {
     const r = notifier(channelId, MEMORY_OFFLINE_WARNING);
     if (r && typeof (r as Promise<void>).then === "function") {
       (r as Promise<void>).catch((err: unknown) => {
+        memoryOfflineWarned.delete(channelId);
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
           `[channel-transcript] memory-offline notifier rejected: ${msg}`,
@@ -244,6 +250,7 @@ function reportMpFailure(channelId: string, reason: string): void {
       });
     }
   } catch (err: unknown) {
+    memoryOfflineWarned.delete(channelId);
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[channel-transcript] memory-offline notifier threw: ${msg}`);
   }
