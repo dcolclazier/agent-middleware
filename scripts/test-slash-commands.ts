@@ -1,9 +1,12 @@
 // Unit tests for parseSlashCommand — pure function, no Discord.
-// Covers: parser precedence (first non-whitespace token only), payload-after-verb
-// extraction, no false-positives on prose like "/end of file is needed",
-// recognition of the full /btw|/cancel|/end family, mentioned/unmentioned
-// equivalence (the parser runs on the post-mention-strip body, so this test
-// validates the body shape both forms produce after BotInstance strips).
+// Covers: parser precedence (first non-whitespace token only — prose with
+// the word "end" mid-sentence is NOT a command; prose that BEGINS with
+// `/end <anything>` IS the /end command, payload ignored per CONTEXT.md),
+// payload-after-verb extraction, recognition of the full /btw|/cancel|/end
+// family, mentioned/unmentioned equivalence (the parser runs on the
+// post-mention-strip body, so this test validates the body shape both
+// forms produce after BotInstance strips). See §5 for the /end-as-first-
+// token cases the parser intentionally matches.
 //
 // Run: npx tsx scripts/test-slash-commands.ts
 //
