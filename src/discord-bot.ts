@@ -43,23 +43,21 @@ const claudeHandler: BotMessageHandler = async (
   // --- Channel slash-commands (CONTEXT.md → /btw, /cancel, /end) ---
   //
   // Detected BEFORE the existing reset: / catch up regex checks so prose
-  // like "/end of file is needed" never reaches the slash-command branch
-  // by accident — the parser is first-token-only and word-boundary-aware
-  // (see scripts/test-slash-commands.ts). Recognition is the same whether
-  // or not the bot was @-mentioned, because BotInstance has already
-  // stripped the mention by the time we run.
+  // with the verb mid-sentence (e.g. "I want to /cancel my subscription")
+  // doesn't reach the slash-command branch — the parser is first-token-only
+  // and word-boundary-aware (see scripts/test-slash-commands.ts).
+  // Recognition is the same whether or not the bot was @-mentioned, because
+  // BotInstance has already stripped the mention by the time we run.
   //
-  // Slice 1 (issue #14) wires /cancel and /end. /btw is recognised here
-  // but its dispatch is Slice 2 (issue #15) — for now we react 🤔 to ack
-  // the user and otherwise no-op.
+  // Note: a message that LITERALLY starts with the verb (e.g. "/end of file
+  // is needed") DOES route to the slash branch with the rest as payload —
+  // /end ignores its payload, so this is correct. See REVIEW-NOTES.md §1
+  // for the deliberate decision to permit payloads on every verb rather
+  // than per-verb grammars.
+  //
+  // /cancel, /end, and /btw all dispatch from this branch (issues #14, #15).
   const slash = parseSlashCommand(content);
   if (slash) {
-    const inFlightSession = existingSessionId ? getSession(existingSessionId) : undefined;
-    const turnInFlight =
-      existingSessionId !== undefined &&
-      inFlightSession !== undefined &&
-      inFlightSession.process !== null;
-
     const safeReact = async (emoji: string) => {
       try { await message.react(emoji); } catch {
         // non-fatal
@@ -67,25 +65,24 @@ const claudeHandler: BotMessageHandler = async (
     };
 
     if (slash.verb === "/cancel") {
-      if (turnInFlight) {
-        cancelTurn(existingSessionId!);
-        await safeReact("💀");
-      } else {
-        await safeReact("⚠️");
-      }
+      // Use cancelTurn's return value (true = subprocess torn down, false =
+      // no in-flight subprocess) instead of a separate is-running check —
+      // the process can exit between the check and the call, which would
+      // otherwise emit 💀 for a no-op cancel.
+      const cancelled = existingSessionId !== undefined && cancelTurn(existingSessionId);
+      await safeReact(cancelled ? "💀" : "⚠️");
       return;
     }
     if (slash.verb === "/end") {
-      // /end ALWAYS clears the channel mapping. If a turn is in flight,
-      // run the cancel first so the subprocess is torn down (single
-      // user-visible step). Payload after /end is intentionally ignored
-      // per CONTEXT.md → /end. The Session record itself stays in
-      // sessions.json so it remains retrievable via the GET-by-id Sessions
-      // API — only the channel mapping is cleared.
-      if (turnInFlight) {
-        cancelTurn(existingSessionId!);
-      }
+      // /end ALWAYS clears the channel mapping. cancelTurn is a no-op when
+      // there's no in-flight subprocess — its return value is ignored here
+      // because /end doesn't distinguish between "had a turn to cancel"
+      // and "didn't"; it just unbinds the channel. Payload after /end is
+      // intentionally ignored per CONTEXT.md → /end. The Session record
+      // itself stays in sessions.json so it remains retrievable via the
+      // GET-by-id Sessions API — only the channel mapping is cleared.
       if (existingSessionId) {
+        cancelTurn(existingSessionId);
         self.clearSessionForChannel(channelId);
       }
       await safeReact("👋");
