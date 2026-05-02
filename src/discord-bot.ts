@@ -74,17 +74,20 @@ const claudeHandler: BotMessageHandler = async (
       return;
     }
     if (slash.verb === "/end") {
-      // /end ALWAYS clears the channel mapping. cancelTurn is a no-op when
-      // there's no in-flight subprocess — its return value is ignored here
-      // because /end doesn't distinguish between "had a turn to cancel"
-      // and "didn't"; it just unbinds the channel. Payload after /end is
-      // intentionally ignored per CONTEXT.md → /end. The Session record
-      // itself stays in sessions.json so it remains retrievable via the
-      // GET-by-id Sessions API — only the channel mapping is cleared.
+      // /end ALWAYS clears the channel mapping (clearSessionForChannel is
+      // a Map.delete underneath and idempotent for unknown keys, so we
+      // can call it unconditionally and the doc claim holds even when
+      // there's no in-flight session). cancelTurn IS guarded — calling
+      // it on an unknown session id would be a no-op but the explicit
+      // guard documents intent ("only tear down if there was something
+      // to tear down"). Payload after /end is intentionally ignored per
+      // CONTEXT.md → /end. The Session record itself stays in
+      // sessions.json so it remains retrievable via the GET-by-id
+      // Sessions API — only the channel mapping is cleared.
       if (existingSessionId) {
         cancelTurn(existingSessionId);
-        self.clearSessionForChannel(channelId);
       }
+      self.clearSessionForChannel(channelId);
       await safeReact("👋");
       return;
     }
