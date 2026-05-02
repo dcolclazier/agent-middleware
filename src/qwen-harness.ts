@@ -30,19 +30,22 @@ import {
   type ToolContext,
 } from "./qwen-tools.js";
 import { recall, maybeRemember } from "./qwen-memory.js";
-import { readFactsAsString } from "./shared-facts.js";
 import {
   isEnabled as mpEnabled,
   mpSearch,
-  mpSearchAsString,
   mpAddDrawer,
   mpUpdateDrawer,
   mpGetDrawer,
   mpKgAdd,
+  type SearchResult,
 } from "./mempalace-client.js";
 import { estimateTokens } from "./token-estimate.js";
 import { loadPersona, getPersonaSync, type Persona } from "./qwen-persona.js";
-import { readVerbatimWindow, type TranscriptEntry } from "./channel-transcript.js";
+import {
+  readVerbatimWindow,
+  searchProse,
+  type TranscriptEntry,
+} from "./channel-transcript.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -128,7 +131,7 @@ const OVERLAY_SOFT_BYTES = 60_000;
 // Layer C — rolling window. After end-of-turn fact extraction (Layer B),
 // session.messages is trimmed to the most recent N user/assistant turn
 // pairs. The dropped turns live on as drawers in the qwen wing and surface
-// via mpSearch in the system prompt's [RELEVANT MEMORIES] block.
+// via mpSearch in the system prompt's [RELEVANT DECISIONS] block.
 // 10 pairs ≈ 20 messages of verbatim history; with average turn size
 // ~1500 tokens this caps the verbatim window at ~30K tokens IF tools
 // haven't been promoted out. Combined with Layer A pointer replacement,
@@ -797,20 +800,90 @@ function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
   return "";
 }
 
+/**
+ * Render a `[RELEVANT DECISIONS]` block from durable-fact strings, trimmed
+ * to TOPICAL_DECISIONS_BUDGET tokens. Drops oldest (=last in array; callers
+ * pass decisions newest-first) entries first until it fits. Returns "" when
+ * the input is empty or every entry would have been trimmed away — callers
+ * omit the block in that case.
+ */
+function renderDecisionsBlock(decisions: string[]): string {
+  if (decisions.length === 0) return "";
+  let n = decisions.length;
+  while (n > 0) {
+    const candidate = `[RELEVANT DECISIONS]\n${decisions
+      .slice(0, n)
+      .map((d) => `- ${d}`)
+      .join("\n")}`;
+    if (estimateTokens(candidate) <= TOPICAL_DECISIONS_BUDGET) {
+      return candidate;
+    }
+    n--;
+  }
+  return "";
+}
+
+/**
+ * Render a `[RELEVANT PROSE]` block from transcript entries, trimmed to
+ * TOPICAL_PROSE_BUDGET tokens. Same oldest-first drop policy as
+ * decisions; assumes callers pass entries in the order they want preserved
+ * (search-relevance / score order). Newlines inside `entry.text` are
+ * collapsed so each entry fits on one line, mirroring the verbatim window.
+ */
+function renderProseBlock(entries: TranscriptEntry[]): string {
+  if (entries.length === 0) return "";
+  const lines = entries.map((e) => {
+    const flatText = e.text.replace(/\r?\n/g, " ");
+    return `${e.timestamp} ${e.author}: ${flatText}`;
+  });
+  let n = lines.length;
+  while (n > 0) {
+    const candidate = `[RELEVANT PROSE]\n${lines.slice(0, n).join("\n")}`;
+    if (estimateTokens(candidate) <= TOPICAL_PROSE_BUDGET) {
+      return candidate;
+    }
+    n--;
+  }
+  return "";
+}
+
+/**
+ * Build the search query used by the topical-decisions and topical-prose
+ * searches in runQwenTurn. Returns the concatenation (joined by newlines)
+ * of the last `n` user messages in `session.messages`. If fewer than `n`
+ * user messages exist, returns whatever is available; if none, "".
+ *
+ * Buffers single-message conversational pivots ("ok", "yes") against the
+ * topical context they're responding to — see issue #7.
+ */
+export function buildLastUserMessagesQuery(
+  session: QwenSession,
+  n = 3,
+): string {
+  if (n <= 0) return "";
+  const userTexts: string[] = [];
+  for (const m of session.messages) {
+    const msg = m as { role?: string; content?: unknown };
+    if (msg?.role === "user" && typeof msg.content === "string") {
+      userTexts.push(msg.content);
+    }
+  }
+  return userTexts.slice(-n).join("\n");
+}
+
 export function buildSystemPrompt(opts: {
   persona: Persona;
-  memories: string[];
-  facts: string;
+  decisions: string[];
+  prose: TranscriptEntry[];
   channelState: string;
   tools: OpenAI.Chat.Completions.ChatCompletionFunctionTool[];
   verbatimWindow: TranscriptEntry[];
 }): string {
-  const { persona, memories, facts, channelState, tools, verbatimWindow } = opts;
+  const { persona, decisions, prose, channelState, tools, verbatimWindow } =
+    opts;
 
-  const memBlock = memories.length
-    ? `[RELEVANT MEMORIES]\n${memories.map((m) => `- ${m}`).join("\n")}`
-    : "";
-  const factBlock = facts.trim() ? `[SHARED FACTS]\n${facts.trim()}` : "";
+  const decisionsBlock = renderDecisionsBlock(decisions);
+  const proseBlock = renderProseBlock(prose);
   const stateBlock = channelState.trim()
     ? `[CHANNEL STATE]\n${channelState.trim()}`
     : "";
@@ -821,13 +894,11 @@ export function buildSystemPrompt(opts: {
     .join("\n");
 
   // Layer D — layered system prompt mirroring MemPalace's L0/L1/L2/L3:
-  //   IDENTITY / VOICE / STATIC MEMORY  → L0 persona (always)
-  //   CHANNEL STATE                     → L1 channel-scoped working memory
-  //   CHANNEL CONVERSATION              → recent verbatim cross-agent recall
-  //   SHARED FACTS / RELEVANT MEMORIES  → L2 retrieval (filtered drawers)
-  //   tools + instructions              → action surface
-  // Channel state is placed near the top so it strongly anchors the model
-  // on the current task; older drawers via search appear lower-priority.
+  //   IDENTITY / VOICE / STATIC MEMORY    → L0 persona (always)
+  //   CHANNEL STATE                       → L1 channel-scoped working memory
+  //   CHANNEL CONVERSATION                → recent verbatim cross-agent recall
+  //   RELEVANT DECISIONS / RELEVANT PROSE → L2 dual-wing topical retrieval
+  //   tools + instructions                → action surface
   const instructionsBlock = `[INSTRUCTIONS]
 - Reason step by step before calling tools.
 - Call tools when you need info or to take action.
@@ -844,8 +915,8 @@ export function buildSystemPrompt(opts: {
     `[STATIC MEMORY]\n${persona.memory.trim()}`,
     stateBlock,
     conversationBlock,
-    factBlock,
-    memBlock,
+    decisionsBlock,
+    proseBlock,
     `[AVAILABLE TOOLS]\n${toolList}`,
     instructionsBlock,
   ]
@@ -1214,6 +1285,68 @@ export function validateWireBudget(
  */
 const VERBATIM_WINDOW_K = 10;
 
+/**
+ * Wings searched for topical durable decisions. Issue #7: decisions and
+ * naming live in `qwen` (per-agent fact extraction); user preferences and
+ * canon observations may also be filed under `shared` for cross-agent reach.
+ */
+const TOPICAL_DECISIONS_WINGS = ["qwen", "shared"] as const;
+
+/**
+ * Rooms searched for topical durable decisions. Issue #7: matches the
+ * Layer-B fact taxonomy in CONTEXT.md (decision / naming / user_preference /
+ * canon_observation). MemPalace's search endpoint accepts a single `room`,
+ * so we fan out one search per (wing, room) and merge by similarity.
+ */
+const TOPICAL_DECISIONS_ROOMS = [
+  "decision",
+  "naming",
+  "user_preference",
+  "canon_observation",
+] as const;
+
+/**
+ * Per-(wing,room) limit for the fan-out search. With 2 wings × 4 rooms = 8
+ * searches at limit 3 each, the merged candidate pool is up to 24 entries —
+ * downstream block rendering trims to TOPICAL_DECISIONS_BUDGET.
+ */
+const TOPICAL_DECISIONS_PER_ROOM_LIMIT = 3;
+
+/**
+ * Run the topical-decisions fan-out. Issues N searches in parallel (one per
+ * wing × room), merges their results, deduplicates by text, sorts by
+ * descending similarity, and returns the de-duped list as plain strings
+ * suitable for the `[RELEVANT DECISIONS]` block. Returns [] when MemPalace
+ * is disabled or every search fails.
+ */
+async function searchTopicalDecisions(query: string): Promise<string[]> {
+  if (!query.trim()) return [];
+  const tasks: Array<Promise<SearchResult[]>> = [];
+  for (const wing of TOPICAL_DECISIONS_WINGS) {
+    for (const room of TOPICAL_DECISIONS_ROOMS) {
+      tasks.push(
+        mpSearch(query, {
+          wing,
+          room,
+          limit: TOPICAL_DECISIONS_PER_ROOM_LIMIT,
+        }),
+      );
+    }
+  }
+  const settled = await Promise.all(tasks);
+  const merged: SearchResult[] = [];
+  for (const arr of settled) merged.push(...arr);
+  merged.sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of merged) {
+    if (seen.has(r.text)) continue;
+    seen.add(r.text);
+    out.push(r.text);
+  }
+  return out;
+}
+
 export async function runQwenTurn(
   channelId: string,
   userMessage: string,
@@ -1302,37 +1435,28 @@ export async function runQwenTurn(
           break;
         }
 
-        // Gather context: persona + shared facts + vector recall + Layer C state.
+        // Gather context: persona + dual-wing topical recall + Layer C state.
         // Budget allocation comes from ADR-0003 sub-budgets:
-        //   topical decisions   → mpSearch(qwen wing) → memories block
-        //   topical prose       → mpSearch(shared wing) → facts block
+        //   topical decisions   → mpSearch over {qwen, shared} wings,
+        //                          {decision, naming, user_preference,
+        //                          canon_observation} rooms → decisions block
+        //   topical prose       → searchProse(channelId) over conversation
+        //                          wing → prose block
         //   channel state       → loadChannelState (truncated below)
-        // Each is converted from token budget to char cap via tokensToChars.
+        // Both searches use the concatenation of the last 3 user messages
+        // as their query — buffers conversational pivots ("ok") against the
+        // topical context they're responding to (issue #7).
         const persona = await ensurePersona();
-        const memoriesCharCap = tokensToChars(TOPICAL_DECISIONS_BUDGET);
-        const memoriesRaw = mpEnabled()
-          ? (
-              await mpSearch(userMessage, { wing: "qwen", limit: 3 })
-            ).map((r) => r.text)
-          : await recall(channelId, userMessage, 3, memoriesCharCap);
-        // Cap the joined memories block to TOPICAL_DECISIONS_BUDGET-equivalent
-        // chars. We keep entries newest-first (caller's order) and stop once
-        // adding one more would overflow.
-        const memories: string[] = [];
-        let memTotal = 0;
-        for (const m of memoriesRaw) {
-          const cost = m.length + 4; // approx "- " prefix + newline
-          if (memTotal + cost > memoriesCharCap) break;
-          memories.push(m);
-          memTotal += cost;
-        }
-        const facts = mpEnabled()
-          ? await mpSearchAsString("", {
-              wing: "shared",
-              limit: 10,
-              maxChars: tokensToChars(TOPICAL_PROSE_BUDGET),
-            })
-          : await readFactsAsString(tokensToChars(TOPICAL_PROSE_BUDGET));
+        const topicalQuery = buildLastUserMessagesQuery(session, 3);
+
+        const decisions = mpEnabled()
+          ? await searchTopicalDecisions(topicalQuery)
+          : await recall(channelId, userMessage, 3, tokensToChars(TOPICAL_DECISIONS_BUDGET));
+
+        const prose = mpEnabled()
+          ? await searchProse(topicalQuery, channelId, 10)
+          : [];
+
         let channelState = await loadChannelState(session);
         // Apply CHANNEL_STATE_BUDGET cap. Truncation is fine here — the
         // markdown is auto-built each turn and the head contains the most
@@ -1343,8 +1467,8 @@ export async function runQwenTurn(
         }
         const systemPrompt = buildSystemPrompt({
           persona,
-          memories,
-          facts,
+          decisions,
+          prose,
           channelState,
           tools: TOOL_SCHEMAS,
           verbatimWindow,

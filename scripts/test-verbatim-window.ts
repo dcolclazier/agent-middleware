@@ -129,8 +129,8 @@ async function main() {
   {
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: [],
@@ -154,8 +154,8 @@ async function main() {
     ];
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: entries,
@@ -208,8 +208,8 @@ async function main() {
     }
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: entries,
@@ -288,8 +288,8 @@ async function main() {
 
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: window,
@@ -337,8 +337,8 @@ async function main() {
     check("readVerbatimWindow returned []", window.length === 0);
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: window,
@@ -351,21 +351,23 @@ async function main() {
   }
 
   // 6. Existing system-prompt blocks are untouched by this slice.
+  // Note: [RELEVANT MEMORIES] / [SHARED FACTS] were replaced by
+  // [RELEVANT DECISIONS] / [RELEVANT PROSE] in slice #7; the assertions
+  // here only cover blocks that survive both slices.
   sect("6. existing blocks unchanged");
   {
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: ["recall-A"],
-      facts: "fact-line",
+      decisions: ["dec-A"],
+      prose: [],
       channelState: "current-task: x",
       tools: noTools,
       verbatimWindow: [],
     });
     check("[CHANNEL STATE] block still rendered", prompt.includes("[CHANNEL STATE]"));
-    check("[SHARED FACTS] block still rendered", prompt.includes("[SHARED FACTS]"));
     check(
-      "[RELEVANT MEMORIES] block still rendered",
-      prompt.includes("[RELEVANT MEMORIES]"),
+      "[RELEVANT DECISIONS] block rendered when decisions provided",
+      prompt.includes("[RELEVANT DECISIONS]"),
     );
   }
 
@@ -383,8 +385,8 @@ async function main() {
     ];
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: entries,
@@ -411,8 +413,8 @@ async function main() {
   {
     const prompt = buildSystemPrompt({
       persona: fakePersona,
-      memories: [],
-      facts: "",
+      decisions: [],
+      prose: [],
       channelState: "",
       tools: noTools,
       verbatimWindow: [],
