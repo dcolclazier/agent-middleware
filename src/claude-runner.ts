@@ -28,13 +28,13 @@ export interface Session {
    */
   suppressDiscordPost?: boolean;
   /**
-   * Set true by `cancelTurn` immediately before SIGTERM. The subprocess
-   * close handler consults this flag to short-circuit the normal "flush
-   * partial output → drain queue → emit status" sequence: a cancelled turn
-   * MUST NOT emit `post-to-discord` for whatever Claude was mid-saying, MUST
-   * NOT auto-resume, MUST NOT emit `error` status. Reset to undefined once
-   * the close handler has acknowledged it. See `cancelTurn` for the contract
-   * this enforces.
+   * Set true by `cancelTurn` after it successfully signals the subprocess
+   * with SIGTERM. The subprocess close handler consults this flag to
+   * short-circuit the normal "flush partial output → drain queue → emit
+   * status" sequence: a cancelled turn MUST NOT emit `post-to-discord` for
+   * whatever Claude was mid-saying, MUST NOT auto-resume, MUST NOT emit
+   * `error` status. Reset to undefined once the close handler has
+   * acknowledged it. See `cancelTurn` for the contract this enforces.
    */
   cancelled?: boolean;
 }
