@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -119,7 +119,11 @@ export function saveSessions() {
     callbackSessionKey: s.callbackSessionKey,
   }));
   const serialized = JSON.stringify(data, null, 2);
-  if (serialized === lastSerialized) return;
+  // Skip the write only when content matches AND the file is still on disk —
+  // if it was externally truncated/deleted (manual `rm`, a botched copy,
+  // etc.), we need to recreate it on the next call rather than silently
+  // returning early forever.
+  if (serialized === lastSerialized && existsSync(SESSIONS_FILE)) return;
   try {
     writeFileSync(SESSIONS_FILE, serialized);
     lastSerialized = serialized;
