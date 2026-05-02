@@ -310,5 +310,35 @@ sect("11. boundary requires \\W (digits/underscore not allowed)");
 }
 
 // ---------------------------------------------------------------------------
+// 12. Boundary is Unicode-aware — JS's \W is ASCII-only, so without the
+//     u-flag fix, /endé would have parsed as /end with payload "é".
+// ---------------------------------------------------------------------------
+sect("12. boundary excludes Unicode letters/digits");
+{
+  check(
+    "/endé → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/endé") === null,
+    `got ${JSON.stringify(parseSlashCommand("/endé"))}`,
+  );
+  check(
+    "/cancelñ → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/cancelñ") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancelñ"))}`,
+  );
+  check(
+    "/btw日本 → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/btw日本") === null,
+    `got ${JSON.stringify(parseSlashCommand("/btw日本"))}`,
+  );
+  // Sanity: Unicode in the payload (after a real boundary) is fine.
+  const r = parseSlashCommand("/btw what about 日本?");
+  check(
+    "/btw with Unicode payload → /btw with payload preserved",
+    r?.verb === "/btw" && r?.payload === "what about 日本?",
+    `got ${JSON.stringify(r)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n======\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

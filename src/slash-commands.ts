@@ -33,24 +33,29 @@ export interface SlashCommand {
 
 const KNOWN_VERBS: ReadonlySet<string> = new Set(["/btw", "/cancel", "/end"]);
 
-// Match: optional leading whitespace, the verb (alphabetic only after the
-// slash), then either end-of-string OR a single non-word boundary char
-// (\W = anything not [A-Za-z0-9_]) which IS consumed so it doesn't leak
-// into the payload.
+// Match: optional leading whitespace, the verb (ASCII alphabetic only
+// after the slash), then either end-of-string OR a single Unicode-aware
+// non-word boundary char (anything that is not a letter, digit, or
+// underscore in any script) which IS consumed so it doesn't leak into
+// the payload.
 //
-// Why \W (not [^a-z]) for the boundary: the looser form treats digits and
-// underscore as boundaries, which would parse `/end2end` as `/end` with
-// payload `end` (verb capture stops at `2`, then `[^a-z]` consumes the
-// `2`) — accidentally triggering /end and clearing the channel mapping.
-// \W requires a real word break (whitespace, punctuation, end-of-string),
-// so identifier-shaped tokens like `/end2`, `/cancel_foo`, `/end2end`
-// fail to match this regex outright and parseSlashCommand returns null.
+// Why a Unicode-aware boundary (not \W): JS's `\W` is ASCII-only —
+// `\w` is exactly `[A-Za-z0-9_]` regardless of the `i` flag — so a
+// Unicode letter like `é` would satisfy `\W` and parse `/endé` as
+// `/end` with payload `é`. The `u` flag plus `[^\p{L}\p{N}_]` rejects
+// any letter or digit in any script, so `/endé`, `/end2`, `/cancel_x`,
+// `/end2end` all fail to match outright and parseSlashCommand returns
+// null.
+//
+// The verb capture itself stays `[a-z]+` (ASCII) — verb names are an
+// internal allowlist (KNOWN_VERBS) of ASCII words; broadening the verb
+// class would just produce more rejection candidates.
 //
 // Capture group 1 = verb (lowercased before lookup).
 // Capture group 2 = the rest of the message AFTER the consumed boundary
 // (the boundary char itself is NOT in group 2). If the verb ended the
 // string, the alternation hits `$` (zero-width) and group 2 is empty.
-const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?:$|\W)([\s\S]*)$/i;
+const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?:$|[^\p{L}\p{N}_])([\s\S]*)$/iu;
 
 /**
  * Parse a channel message body for a slash-command verb.
