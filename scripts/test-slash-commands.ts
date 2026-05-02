@@ -1,9 +1,16 @@
 // Unit tests for parseSlashCommand — pure function, no Discord.
 // Covers: parser precedence (first non-whitespace token only), payload-after-verb
-// extraction, no false-positives on prose like "/end of file is needed",
-// recognition of the full /btw|/cancel|/end family, mentioned/unmentioned
-// equivalence (the parser runs on the post-mention-strip body, so this test
-// validates the body shape both forms produce after BotInstance strips).
+// extraction, leading separator stripping, no false-positives when the verb
+// appears MID-SENTENCE (e.g. "I want to /cancel my subscription"), recognition
+// of the full /btw|/cancel|/end family, mentioned/unmentioned equivalence (the
+// parser runs on the post-mention-strip body, so this test validates the body
+// shape both forms produce after BotInstance strips).
+//
+// Note on first-token semantics: a message that LITERALLY starts with the
+// verb (e.g. "/end of file is needed") DOES route through with the rest as
+// payload — that's the deliberate parse-shape decision in REVIEW-NOTES.md §1.
+// The "false-positive" class this parser rejects is verb-mid-prose, not
+// verb-first-with-trailing-words. See §5 below.
 //
 // Run: npx tsx scripts/test-slash-commands.ts
 //
@@ -189,6 +196,23 @@ sect("6. verb must be word-bounded");
   check(
     "/end. please",
     parseSlashCommand("/end. please")?.verb === "/end",
+  );
+  // Leading separator punctuation between verb and payload is consumed,
+  // so `/btw: question` and `/btw, question` both yield payload "question".
+  check(
+    "/btw: question payload strips colon separator",
+    parseSlashCommand("/btw: question")?.payload === "question",
+    `got ${JSON.stringify(parseSlashCommand("/btw: question"))}`,
+  );
+  check(
+    "/btw, question payload strips comma separator",
+    parseSlashCommand("/btw, question")?.payload === "question",
+    `got ${JSON.stringify(parseSlashCommand("/btw, question"))}`,
+  );
+  check(
+    "/btw:hello payload strips colon (no whitespace)",
+    parseSlashCommand("/btw:hello")?.payload === "hello",
+    `got ${JSON.stringify(parseSlashCommand("/btw:hello"))}`,
   );
 }
 

@@ -27,7 +27,12 @@ export type SlashVerb = "/btw" | "/cancel" | "/end";
 
 export interface SlashCommand {
   verb: SlashVerb;
-  /** Everything after the verb, with leading/trailing whitespace stripped. Internal whitespace (including newlines) is preserved verbatim so multi-line `/btw` payloads keep their formatting. */
+  /**
+   * Everything after the verb, with leading separators (whitespace and the
+   * common verb→payload punctuation `:` `,` `;` `.`) and trailing whitespace
+   * stripped. Internal whitespace (including newlines) is preserved verbatim
+   * so multi-line `/btw` payloads keep their formatting.
+   */
   payload: string;
 }
 
@@ -66,12 +71,15 @@ export function parseSlashCommand(content: string): SlashCommand | null {
   if (!KNOWN_VERBS.has(verb)) return null;
 
   // Everything after the verb's word-boundary char. The boundary char itself
-  // (whitespace or punctuation) lives in group 2's leading position; we trim
-  // leading/trailing whitespace but preserve internal whitespace verbatim so
-  // multi-line `/btw` payloads keep their formatting (collapsing newlines
-  // would silently destroy structure in code blocks, lists, etc.).
+  // (whitespace or punctuation) lives in group 2's leading position. We strip
+  // leading separators — whitespace plus the common verb→payload punctuation
+  // `:` `,` `;` `.` — so `/btw: question` and `/btw, question` both yield
+  // payload `"question"` instead of `": question"`. Internal whitespace
+  // (including newlines) is preserved verbatim so multi-line `/btw` payloads
+  // keep their formatting (collapsing newlines would silently destroy
+  // structure in code blocks, lists, etc.). Trailing whitespace is trimmed.
   const rawPayload = m[2] ?? "";
-  const payload = rawPayload.trim();
+  const payload = rawPayload.replace(/^[\s:.,;]+/, "").trimEnd();
 
   return { verb: verb as SlashVerb, payload };
 }
