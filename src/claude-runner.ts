@@ -258,7 +258,6 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
     if (session.cancelled) {
       session.process = null;
       session.cancelled = undefined;
-      session.messageQueue = [];
       // Discard partial output: the contract says cancel drops what the
       // turn produced before SIGTERM. Without this, getProgress() and
       // listSessions() would still surface stale fragments captured
@@ -272,6 +271,16 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
       saveSessions();
       sessionEvents.emit(`status:${session.id}`, session.status);
       sessionEvents.emit("status", { sessionId: session.id, status: session.status });
+      // Anything still in messageQueue was enqueued AFTER cancelTurn()
+      // emptied it — i.e. the user sent a follow-up during the brief
+      // SIGTERM→close window. Without this drain, sendMessage() saw
+      // status === "running" and queued the message, then we'd silently
+      // drop it. Deliver via the normal resume path; subsequent queue
+      // entries cascade through the standard close-handler drain below.
+      if (session.messageQueue.length > 0) {
+        const nextMsg = session.messageQueue.shift()!;
+        resumeWithPrompt(session, nextMsg);
+      }
       return;
     }
 
