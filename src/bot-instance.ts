@@ -250,12 +250,18 @@ export function evaluateTurnSize(
  *   framing); embedded false-positive closes are skipped and the search
  *   continues for a real boundary-flanked one.
  * - Truncate-mid-attachment: when no boundary-flanked close exists, the cut
- *   landed inside the attachment. We push a partial attachment with as much
- *   content as we have. If the trailing TURN_TRUNCATE_MARKER got smuggled
- *   into that partial content (it's appended to the whole body, so when the
- *   cut is mid-attachment the marker ends up after the partial content),
- *   strip it back out and keep it as trailing prose so it doesn't pollute
- *   attachment.content.
+ *   landed inside the attachment. We do NOT synthesise a parsed entry for
+ *   the partial — downstream renderers re-emit parsed attachments with a
+ *   `[/ATTACHMENT]` closing tag that was NOT in the truncated body, which
+ *   would push the handler-visible prompt past the cap evaluateTurnSize
+ *   already enforced. Instead the partial-attachment tail flows through as
+ *   plain `content` (cleanly-closed earlier attachments stay in `parsed`
+ *   because their original closing tags survived in the truncated body).
+ * - Byte-preservation: only the explicit `\n` / `\n\n` separators we know
+ *   were prepended get stripped. We never trim attachment content or the
+ *   final trailing prose — readAttachments preserves attachment content
+ *   verbatim, and downstream token estimation / directive parsing depends
+ *   on those bytes being unchanged.
  *
  * Exported for direct testing — see scripts/test-oversize-turn.ts.
  */
@@ -284,30 +290,31 @@ export function splitLeadingAttachmentBlocks(
       searchFrom = candidate + 1;
     }
     if (closeIndex === -1) {
-      // Truncation cut mid-attachment. Build the partial content from the
-      // header onward, then peel off the appended TURN_TRUNCATE_MARKER if
-      // it got rolled into the partial — leaving the marker inside an
-      // attachment body would mislead any downstream code that treats
-      // attachment.content as verbatim file content.
-      let partial = remaining.slice(contentStart);
-      let trailing = "";
-      if (partial.endsWith(TURN_TRUNCATE_MARKER)) {
-        partial = partial.slice(0, partial.length - TURN_TRUNCATE_MARKER.length);
-        trailing = TURN_TRUNCATE_MARKER.replace(/^\n+/, "");
-      }
-      parsed.push({ name, content: partial.trimEnd() });
-      remaining = trailing;
-      break;
+      // Truncation cut mid-attachment. Treat the rest as unsplittable: emit
+      // `remaining` (the partial `[ATTACHMENT: name]\n<partial-content>`
+      // tail, including any trailing `[truncated]` marker) as content. We
+      // deliberately don't synthesise a parsed entry — handlers re-render
+      // parsed attachments with a `[/ATTACHMENT]` closing tag that the
+      // budgeted body never contained, which would silently push the
+      // handler-visible prompt past evaluateTurnSize's targetTokens cap.
+      // Previously-closed attachments stay in `parsed` (their original
+      // closing tags survived intact in the truncated body, so re-emitting
+      // them doesn't add synthetic bytes).
+      return { content: remaining, attachments: parsed };
     }
     parsed.push({
       name,
       content: remaining.slice(contentStart, closeIndex),
     });
     remaining = remaining.slice(closeIndex + closingTag.length);
+    // Only strip the specific `\n` / `\n\n` separator we know was prepended
+    // to chain blocks together. Don't trim — readAttachments preserves
+    // content verbatim, so trailing prose may legitimately start with
+    // whitespace and downstream code is entitled to see it unchanged.
     if (remaining.startsWith("\n\n")) remaining = remaining.slice(2);
     else if (remaining.startsWith("\n")) remaining = remaining.slice(1);
   }
-  return { content: remaining.trimStart(), attachments: parsed };
+  return { content: remaining, attachments: parsed };
 }
 
 // --- Outbound sentinel parser ---

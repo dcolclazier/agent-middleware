@@ -105,12 +105,14 @@ sect("3. pure: bot + over → truncate_bot");
   check("kind is truncate_bot", d.kind === "truncate_bot");
   if (d.kind === "truncate_bot") {
     check("originalTokens matches input", d.originalTokens === tokens);
-    // Truncated body should sit at or under TURN_BUDGET * 0.9 = 19_800,
-    // with a small slack for the appended [truncated] marker.
+    // Truncated body should sit at or under TURN_BUDGET * 0.9 = 19_800.
+    // evaluateTurnSize appends the [truncated] marker INSIDE its scaling
+    // loop and re-measures the full emitted body each iteration, so the
+    // returned truncatedTokens is guaranteed to satisfy `<= cap` exactly.
     const cap = Math.floor(TURN_BUDGET * 0.9);
     check(
-      "truncatedTokens at or under 90% of TURN_BUDGET (+ small marker slack)",
-      d.truncatedTokens <= cap + 32,
+      "truncatedTokens at or under 90% of TURN_BUDGET",
+      d.truncatedTokens <= cap,
       `got: ${d.truncatedTokens}, cap: ${cap}`,
     );
     check(
@@ -218,8 +220,8 @@ sect("5. wiring: bot + over → warning posted, abort=false, body truncated");
   check("returns truncated body", result.body.length < big.length);
   check("truncated body has marker", result.body.includes("[truncated]"));
   check(
-    "truncated body fits within ~90% of TURN_BUDGET (+ marker slack)",
-    estimateTokens(result.body) <= Math.floor(TURN_BUDGET * 0.9) + 32,
+    "truncated body fits within 90% of TURN_BUDGET",
+    estimateTokens(result.body) <= Math.floor(TURN_BUDGET * 0.9),
   );
   check("exactly one warning sent", sent.length === 1);
   check(
@@ -384,32 +386,57 @@ sect("10. splitLeadingAttachmentBlocks: boundary check skips embedded close");
 
 sect("11. splitLeadingAttachmentBlocks: truncation cut mid-attachment");
 {
-  // Simulate a truncated body that cut mid-attachment, with the
-  // TURN_TRUNCATE_MARKER appended to the whole. The marker MUST NOT end
-  // up inside attachment.content.
+  // When truncation cuts mid-attachment (no boundary-flanked closing tag),
+  // the helper does NOT synthesise a parsed entry for the partial.
+  // Downstream renderers re-emit parsed attachments with a `[/ATTACHMENT]`
+  // closing tag that wasn't in the budgeted body, which would push the
+  // handler-visible prompt past the cap evaluateTurnSize already enforced.
+  // Instead the partial-attachment tail (including any trailing
+  // [truncated] marker) flows through verbatim as `content`.
   const body =
     `[ATTACHMENT: huge.log]\n` +
     `partial content that was cut off here` +
     `\n\n[truncated]`;
   const split = splitLeadingAttachmentBlocks(body);
-  check("one partial attachment recovered", split.attachments.length === 1);
   check(
-    "partial attachment name preserved",
-    split.attachments[0]?.name === "huge.log",
+    "no partial attachment synthesised",
+    split.attachments.length === 0,
+    `got: ${split.attachments.length}`,
   );
   check(
-    "marker NOT smuggled into attachment.content",
-    !(split.attachments[0]?.content.includes("[truncated]") ?? false),
-    `got: ${JSON.stringify(split.attachments[0]?.content?.slice(-60))}`,
+    "partial-attachment tail flows through as content (verbatim)",
+    split.content === body,
+    `got: ${JSON.stringify(split.content)}`,
+  );
+}
+
+sect("11b. splitLeadingAttachmentBlocks: closed attachment + mid-attachment cut");
+{
+  // A clean attachment closes, then truncation cuts inside the next one.
+  // The closed attachment IS recovered (its closing tag survived in the
+  // truncated body, so re-emitting adds no synthetic bytes). The partial
+  // tail still flows through as content.
+  const body =
+    `[ATTACHMENT: small.md]\nfirst content\n[/ATTACHMENT]\n\n` +
+    `[ATTACHMENT: huge.log]\nstart of huge\n\n[truncated]`;
+  const split = splitLeadingAttachmentBlocks(body);
+  check(
+    "first (closed) attachment recovered",
+    split.attachments.length === 1,
+    `got: ${split.attachments.length}`,
   );
   check(
-    "partial content preserved up to the cut",
-    split.attachments[0]?.content === "partial content that was cut off here",
+    "closed attachment name preserved",
+    split.attachments[0]?.name === "small.md",
   );
   check(
-    "marker preserved as trailing content",
-    split.content.includes("[truncated]"),
-    `content: ${JSON.stringify(split.content)}`,
+    "closed attachment content verbatim",
+    split.attachments[0]?.content === "first content",
+  );
+  check(
+    "partial-attachment tail flows through as content",
+    split.content === `[ATTACHMENT: huge.log]\nstart of huge\n\n[truncated]`,
+    `got: ${JSON.stringify(split.content)}`,
   );
 }
 
