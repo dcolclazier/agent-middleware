@@ -38,13 +38,18 @@ export interface Session {
    */
   cancelled?: boolean;
   /**
-   * When true, this session is held in the in-memory `sessions` map for the
-   * duration of its single turn but is NEVER written to `sessions.json`
-   * (saveSessions skips it) and is removed from the map on terminal status
-   * (`complete` / `error`). Used by `/btw` side sessions per ADR-0002 — the
-   * side session is single-turn and intentionally has no persistence
+   * When true, this session is NEVER written to `sessions.json`
+   * (`saveSessions` skips it). Used by `/btw` side sessions per ADR-0002 —
+   * the side session is single-turn and intentionally has no persistence
    * footprint. The post-to-discord event still fires so the channel reply
-   * lands; only the persistence + lifetime change.
+   * lands; only persistence changes.
+   *
+   * Lifetime: the Session record stays in the in-memory `sessions` map for
+   * the rest of the process lifetime (bounded by `/btw` traffic; cleared
+   * at the next restart). A future slice can add an explicit map sweep on
+   * terminal status if `/btw` traffic grows enough that retained
+   * `outputBuffer` arrays show up in heap profiles. Aligned with the
+   * matching note in `src/side-session.ts`.
    */
   ephemeral?: boolean;
 }
@@ -86,6 +91,15 @@ interface PersistedSession {
   callbackSessionKey: string | null;
 }
 
+// Cache of the last-written serialized payload. `saveSessions()` is called
+// on every session-state transition, including lifecycle events for
+// ephemeral sessions that are filtered out of the persisted output. Without
+// this cache, /btw bursts at the 5 msg/sec Discord rate would produce ~3
+// redundant writes per /btw with identical content. Comparing the payload
+// to lastSerialized lets us skip the writeFileSync when nothing persistent
+// changed, with no semantic change to callers.
+let lastSerialized: string | null = null;
+
 export function saveSessions() {
   // Ephemeral sessions (e.g. /btw side sessions) are intentionally excluded
   // from persistence — they are single-turn and discarded on terminal
@@ -104,8 +118,11 @@ export function saveSessions() {
     error: s.error,
     callbackSessionKey: s.callbackSessionKey,
   }));
+  const serialized = JSON.stringify(data, null, 2);
+  if (serialized === lastSerialized) return;
   try {
-    writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    writeFileSync(SESSIONS_FILE, serialized);
+    lastSerialized = serialized;
   } catch (err) {
     console.error(`Failed to save sessions: ${err}`);
   }
