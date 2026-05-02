@@ -72,9 +72,21 @@ sect("2. verb + payload");
   );
   const r2 = parseSlashCommand("/cancel    please");
   check(
-    "/cancel with multi-space payload (collapsed to one)",
+    "/cancel with leading-whitespace payload (leading trimmed)",
     r2?.verb === "/cancel" && r2?.payload === "please",
     `got ${JSON.stringify(r2)}`,
+  );
+  const r3 = parseSlashCommand("/btw line one\nline two\n\nline four");
+  check(
+    "/btw payload preserves internal newlines verbatim",
+    r3?.verb === "/btw" && r3?.payload === "line one\nline two\n\nline four",
+    `got ${JSON.stringify(r3)}`,
+  );
+  const r4 = parseSlashCommand("/btw multi  spaces  here");
+  check(
+    "/btw payload preserves multi-space runs verbatim",
+    r4?.verb === "/btw" && r4?.payload === "multi  spaces  here",
+    `got ${JSON.stringify(r4)}`,
   );
 }
 

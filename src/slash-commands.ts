@@ -27,7 +27,7 @@ export type SlashVerb = "/btw" | "/cancel" | "/end";
 
 export interface SlashCommand {
   verb: SlashVerb;
-  /** Everything after the verb, leading/trailing whitespace stripped, internal whitespace collapsed to single spaces. */
+  /** Everything after the verb, with leading/trailing whitespace stripped. Internal whitespace (including newlines) is preserved verbatim so multi-line `/btw` payloads keep their formatting. */
   payload: string;
 }
 
@@ -66,10 +66,12 @@ export function parseSlashCommand(content: string): SlashCommand | null {
   if (!KNOWN_VERBS.has(verb)) return null;
 
   // Everything after the verb's word-boundary char. The boundary char itself
-  // (whitespace or punctuation) lives in group 2's leading position; trim
-  // and collapse internal whitespace so the payload is normalized.
+  // (whitespace or punctuation) lives in group 2's leading position; we trim
+  // leading/trailing whitespace but preserve internal whitespace verbatim so
+  // multi-line `/btw` payloads keep their formatting (collapsing newlines
+  // would silently destroy structure in code blocks, lists, etc.).
   const rawPayload = m[2] ?? "";
-  const payload = rawPayload.replace(/\s+/g, " ").trim();
+  const payload = rawPayload.trim();
 
   return { verb: verb as SlashVerb, payload };
 }
