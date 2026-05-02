@@ -1,4 +1,4 @@
-# ADR-0002: `/btw` side sessions use a fresh Claude session id, not concurrent `--resume`
+# ADR-0005: `/btw` side sessions use a fresh Claude session id, not concurrent `--resume`
 
 **Status:** Accepted — 2026-05-02
 **Related:** `src/discord-bot.ts:claudeHandler`, `src/claude-runner.ts:createSession`, CONTEXT.md → "Side session"

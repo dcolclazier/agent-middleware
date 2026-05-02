@@ -6,11 +6,11 @@
 // unknown verbs, or messages where the verb appears mid-sentence rather
 // than at the start.
 //
-// Why first-token only? The brief is explicit: "prose like '/end of file
-// is needed' is NOT triggered as a command." More precisely, "I want to
-// /cancel my subscription" must NOT trigger /cancel, because the verb is
-// not the first token. "/end of file is needed" DOES trigger /end (verb
-// is first; payload is "of file is needed") — `/end`'s caller is
+// Why first-token only? A slash verb is only recognized when it is the
+// first non-whitespace token. So "I want to /cancel my subscription"
+// must NOT trigger /cancel, because the verb is not the first token.
+// By contrast, "/end of file is needed" DOES trigger /end (verb is
+// first; payload is "of file is needed") — `/end`'s caller is
 // responsible for ignoring the payload per the brief.
 //
 // Word-boundary check: `/cancelling now` is NOT `/cancel` — the verb must
@@ -28,29 +28,41 @@ export type SlashVerb = "/btw" | "/cancel" | "/end";
 export interface SlashCommand {
   verb: SlashVerb;
   /**
-   * Everything after the verb, with leading separators (whitespace and the
-   * common verb→payload punctuation `:` `,` `;` `.`) and trailing whitespace
-   * stripped. Internal whitespace (including newlines) is preserved verbatim
-   * so multi-line `/btw` payloads keep their formatting.
+   * Everything after the verb's boundary char (which is consumed by the
+   * regex), with leading separators (whitespace and the common verb→payload
+   * punctuation `:` `,` `;` `.`) and trailing whitespace stripped. Internal
+   * whitespace (including newlines) is preserved verbatim so multi-line
+   * `/btw` payloads keep their formatting (`/btw` is the slice-2 consumer
+   * of payload — see ADR-0005; `/cancel` and `/end` ignore their payloads).
    */
   payload: string;
 }
 
 const KNOWN_VERBS: ReadonlySet<string> = new Set(["/btw", "/cancel", "/end"]);
 
-// Match: optional leading whitespace, the verb (lowercase letters only after
-// the slash), then either end-of-string OR a non-alphanumeric, non-underscore
-// character (whitespace, punctuation, etc.). The boundary class
-// `[^a-z0-9_]` excludes digits and underscores so inputs like `/end2` or
-// `/cancel_all` are NOT silently parsed as `/end` / `/cancel` with a
-// digit/underscore-prefixed payload — adding a new verb that includes
-// digits or underscores requires an explicit parser update rather than a
-// silent match.
+// Match: optional leading whitespace, the verb (ASCII alphabetic only
+// after the slash), then either end-of-string OR a single Unicode-aware
+// non-word boundary char (anything that is not a letter, digit, or
+// underscore in any script) which IS consumed so it doesn't leak into
+// the payload.
+//
+// Why a Unicode-aware boundary (not \W): JS's `\W` is ASCII-only —
+// `\w` is exactly `[A-Za-z0-9_]` regardless of the `i` flag — so a
+// Unicode letter like `é` would satisfy `\W` and parse `/endé` as
+// `/end` with payload `é`. The `u` flag plus `[^\p{L}\p{N}_]` rejects
+// any letter or digit in any script, so `/endé`, `/end2`, `/cancel_x`,
+// `/end2end` all fail to match outright and parseSlashCommand returns
+// null.
+//
+// The verb capture itself stays `[a-z]+` (ASCII) — verb names are an
+// internal allowlist (KNOWN_VERBS) of ASCII words; broadening the verb
+// class would just produce more rejection candidates.
 //
 // Capture group 1 = verb (lowercased before lookup).
-// Capture group 2 = the rest of the message AFTER the verb's trailing
-// boundary character. If the verb ended the string, group 2 is empty.
-const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?=$|[^a-z0-9_])([\s\S]*)$/i;
+// Capture group 2 = the rest of the message AFTER the consumed boundary
+// (the boundary char itself is NOT in group 2). If the verb ended the
+// string, the alternation hits `$` (zero-width) and group 2 is empty.
+const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?:$|[^\p{L}\p{N}_])([\s\S]*)$/iu;
 
 /**
  * Parse a channel message body for a slash-command verb.
@@ -73,14 +85,14 @@ export function parseSlashCommand(content: string): SlashCommand | null {
   const verb = (m[1] ?? "").toLowerCase();
   if (!KNOWN_VERBS.has(verb)) return null;
 
-  // Everything after the verb's word-boundary char. The boundary char itself
-  // (whitespace or punctuation) lives in group 2's leading position. We strip
-  // leading separators — whitespace plus the common verb→payload punctuation
-  // `:` `,` `;` `.` — so `/btw: question` and `/btw, question` both yield
-  // payload `"question"` instead of `": question"`. Internal whitespace
-  // (including newlines) is preserved verbatim so multi-line `/btw` payloads
-  // keep their formatting (collapsing newlines would silently destroy
-  // structure in code blocks, lists, etc.). Trailing whitespace is trimmed.
+  // Group 2 is everything AFTER the boundary char (which the regex
+  // consumed). Strip leading separators — whitespace plus the common
+  // verb→payload punctuation `:` `,` `;` `.` — so `/btw:: hello` yields
+  // payload `"hello"` (the regex consumes one ":", we strip the rest).
+  // Internal whitespace (including newlines) is preserved verbatim so
+  // multi-line `/btw` payloads keep their formatting (collapsing newlines
+  // would silently destroy structure in code blocks, lists, etc.).
+  // Trailing whitespace is trimmed.
   const rawPayload = m[2] ?? "";
   const payload = rawPayload.replace(/^[\s:.,;]+/, "").trimEnd();
 

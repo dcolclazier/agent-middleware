@@ -3,9 +3,9 @@
 // Implements the dispatch path for the `/btw` channel slash-command (issue
 // #15). A side session is an ephemeral, single-turn `Session` that runs a
 // quick aside in parallel to the channel's main turn — see CONTEXT.md →
-// Side session and ADR-0002.
+// Side session and ADR-0005.
 //
-// Load-bearing rules from ADR-0002 and the agent brief on #15:
+// Load-bearing rules from ADR-0005 and the agent brief on #15:
 //
 //  - Side session is created with a FRESH Claude session id. We MUST NOT
 //    pass `--resume <main-claude-session-id>` because two `claude -p

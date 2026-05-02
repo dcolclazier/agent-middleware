@@ -37,7 +37,7 @@ Discord bot + Claude/Qwen orchestrator. Hosts the `ClaudeCode#1840` and Qwen Dis
 
 **External services this depends on:**
 - `dcc-canon-rag` (port 3001) — embed/search over `dcc` canon. URLs: `RAG_EMBED_URL`, `CANON_SEARCH_URL`.
-- `MemPalace` (port 8100, Spark #2) — shared cross-agent memory. Toggled by `MEMPALACE_ENABLED`.
+- `MemPalace` (port 8100, Spark #2) — shared cross-agent memory. Toggled by `MEMPALACE_ENABLED`. Deploy artifacts (api-server, deploy script, MCP proxy) live in `tools/mempalace/`; the corpus-mining script is in `dcc/tools/mempalace/mine-training-data.sh` because it's coupled to dcc's content layout. See [ADR-0006](docs/adr/0006-mempalace-deploy-artifacts-colocated-with-middleware.md).
 - Qwen vLLM (Spark #1, `QWEN_VLLM_URL`).
 - A clone of `dcolclazier/dcc` at `CLAUDE_CWD` (Claude's cwd) and `CANON_REPO_PATH` (canon worktree base). On Spark #2 this is a **sparse checkout** containing only `SPARK/training_data_truth/canon/`, `SPARK/output/canon/`, `CLAUDE.md`, `.claude/`.
 

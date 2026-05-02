@@ -28,8 +28,7 @@
 
 import { writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { join } from "path";
 
 // --- Test harness setup ---
 
@@ -64,24 +63,20 @@ setTimeout(() => {
 );
 
 process.env.CLAUDE_BIN = "node";
-process.env.CLAUDE_BIN_PREFIX_ARGS = stubScript;
+process.env.CLAUDE_BIN_PREFIX_ARG = stubScript;
 process.env.CLAUDE_CWD = tmpDir;
 process.env.STUB_DELAY_MS = "80";
+// Isolate test persistence: claude-runner now reads CLAUDE_SESSIONS_FILE
+// for the persistent state path (per main's slice 1 review iter-7 fix), so
+// we point it at the test's tmpDir instead of polluting the repo-local
+// sessions.json with FAKE-SESSION-ID fixtures across runs.
+const SESSIONS_FILE = join(tmpDir, "sessions.json");
+process.env.CLAUDE_SESSIONS_FILE = SESSIONS_FILE;
 
 const runner = await import("../src/claude-runner.js");
 const sideSessionMod = await import("../src/side-session.js");
 const { createSession, sendMessage, getSession, sessionEvents } = runner;
 const { enqueueSideTurn, seedSidePrompt, _resetSideSessionStateForTests } = sideSessionMod;
-
-// SESSIONS_FILE lives next to the runner module (../sessions.json relative
-// to dist; via tsx, relative to src/). Compute the same path the runner uses
-// — `fileURLToPath` is required for Windows correctness (`URL.pathname`
-// returns `/C:/...` with a leading slash and URL-escaped chars).
-const SESSIONS_FILE = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "sessions.json",
-);
 
 let failed = 0;
 let passed = 0;
@@ -586,8 +581,7 @@ try {
   // -------------------------------------------------------------------------
   // 6. Per-channel queue cap: an 11th /btw beyond the slot+10 queued is
   //    soft-rejected so a hostile client cannot grow the queue without
-  //    bound. This is a defence-in-depth correctness fix surfaced during
-  //    self-review (see REVIEW-NOTES.md).
+  //    bound. This is a defence-in-depth correctness fix from self-review.
   // -------------------------------------------------------------------------
   sect("6. per-channel queue cap");
   {

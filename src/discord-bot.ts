@@ -42,18 +42,16 @@ const claudeHandler: BotMessageHandler = async (
 
   // --- Channel slash-commands (CONTEXT.md → /btw, /cancel, /end) ---
   //
-  // Detected BEFORE the existing reset: / catch up regex checks so prose
-  // with the verb mid-sentence (e.g. "I want to /cancel my subscription")
-  // doesn't reach the slash-command branch — the parser is first-token-only
-  // and word-boundary-aware (see scripts/test-slash-commands.ts).
-  // Recognition is the same whether or not the bot was @-mentioned, because
-  // BotInstance has already stripped the mention by the time we run.
-  //
-  // Note: a message that LITERALLY starts with the verb (e.g. "/end of file
-  // is needed") DOES route to the slash branch with the rest as payload —
-  // /end ignores its payload, so this is correct. See REVIEW-NOTES.md §1
-  // for the deliberate decision to permit payloads on every verb rather
-  // than per-verb grammars.
+  // Detected BEFORE the existing reset: / catch up regex checks. The
+  // parser is first-token-only — `/cancel`, `/end`, and `/btw` only match
+  // as the initial token of the post-mention-strip body, so prose that
+  // contains those words mid-sentence does not trigger them. `/end
+  // <payload>` and `/cancel <payload>` ARE matched (the verb-as-first-
+  // token rule); each verb's dispatcher decides what to do with the
+  // payload (`/cancel` and `/end` ignore it; `/btw` feeds it into the
+  // side-session prompt). Recognition is the same whether or not the bot
+  // was @-mentioned, because BotInstance has already stripped the mention
+  // by the time we run.
   //
   // /cancel, /end, and /btw all dispatch from this branch (issues #14, #15).
   const slash = parseSlashCommand(content);
@@ -65,34 +63,49 @@ const claudeHandler: BotMessageHandler = async (
     };
 
     if (slash.verb === "/cancel") {
-      // Use cancelTurn's return value (true = subprocess torn down, false =
-      // no in-flight subprocess) instead of a separate is-running check —
-      // the process can exit between the check and the call, which would
-      // otherwise emit 💀 for a no-op cancel.
-      const cancelled = existingSessionId !== undefined && cancelTurn(existingSessionId);
+      // Drive 💀/⚠️ from cancelTurn's actual return rather than a
+      // precomputed in-flight flag — the subprocess can exit between
+      // the check and the SIGTERM, which would otherwise surface as a
+      // false-positive 💀 when the brief says ⚠️.
+      const cancelled = existingSessionId ? cancelTurn(existingSessionId) : false;
       await safeReact(cancelled ? "💀" : "⚠️");
       return;
     }
     if (slash.verb === "/end") {
-      // /end ALWAYS clears the channel mapping (clearSessionForChannel is
-      // a Map.delete underneath and idempotent for unknown keys, so we
-      // can call it unconditionally and the doc claim holds even when
-      // there's no in-flight session). cancelTurn IS guarded — calling
-      // it on an unknown session id would be a no-op but the explicit
-      // guard documents intent ("only tear down if there was something
-      // to tear down"). Payload after /end is intentionally ignored per
-      // CONTEXT.md → /end. The Session record itself stays in
-      // sessions.json so it remains retrievable via the GET-by-id
-      // Sessions API — only the channel mapping is cleared.
+      // /end ALWAYS reacts 👋 and ALWAYS clears the channel mapping (even
+      // on an idle channel — clearSessionForChannel is a Map.delete and
+      // idempotent for unknown keys, so the unconditional call below
+      // matches the doc claim). When a session is in flight, also tear
+      // it down: cancelTurn is a no-op when nothing is running, but the
+      // explicit guard documents intent. The Session record itself stays
+      // in sessions.json so it remains retrievable via the GET-by-id
+      // Sessions API; only the channel mapping is cleared.
+      //
+      // Trigger is also cleared so a subsequently-resumed session via
+      // POST /api/sessions/:id/message can't leak its post-to-discord
+      // back to this channel via the sessionTriggers lookup path. After
+      // /end the channel must be fully dissociated.
+      //
+      // suppressDiscordPost is set as belt-and-braces against the
+      // narrow case where cancelTurn returns false (process already
+      // exited naturally between exitCode check and SIGTERM): the close
+      // handler still fires, takes the non-cancellation branch, and
+      // tries to post the just-finished turn's output. With the trigger
+      // cleared, postToDiscord would fall back to TARGET_CHANNEL_ID and
+      // post the leftover output to an unrelated default channel.
+      // Setting suppressDiscordPost short-circuits the listener.
       if (existingSessionId) {
         cancelTurn(existingSessionId);
+        const session = getSession(existingSessionId);
+        if (session) session.suppressDiscordPost = true;
+        self.clearTrigger(existingSessionId);
       }
       self.clearSessionForChannel(channelId);
       await safeReact("👋");
       return;
     }
     // /btw — spawn an ephemeral side session that runs in parallel to the
-    // main turn. ADR-0002: fresh Claude session id (NOT a --resume of the
+    // main turn. ADR-0005: fresh Claude session id (NOT a --resume of the
     // main session). At most ONE in-flight side session per channel; a
     // second /btw queues with ⏳ and drains FIFO. The side session posts
     // its answer to the channel via the existing post-to-discord listener

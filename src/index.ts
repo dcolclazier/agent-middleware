@@ -1,3 +1,8 @@
+// `.env` must be parsed BEFORE any other module is imported, because many
+// modules (qwen-persona, claude-runner, mempalace-client, ...) capture
+// `process.env.*` at module-init time. See bootstrap-env.ts.
+import "./bootstrap-env.js";
+
 import express from "express";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "url";
@@ -27,26 +32,7 @@ import {
   type Agent,
 } from "./canon-commit.js";
 import { runQwenTurn, getQwenSession } from "./qwen-harness.js";
-
-// Load .env manually (no dotenv dependency)
-import { readFileSync } from "fs";
-try {
-  const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
-  const envContent = readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim();
-    if (!process.env[key]) {
-      process.env[key] = value;
-    }
-  }
-} catch {
-  // .env is optional
-}
+import { loadPersona } from "./qwen-persona.js";
 
 // --- Process-level crash safety ---
 //
@@ -112,6 +98,20 @@ process.on("SIGINT", () => {
 
 // Restore persisted sessions before starting
 loadSessions();
+
+// Validate persona budget before any bot or HTTP listener starts. loadPersona()
+// throws if the combined SOUL.md/MEMORY.md/IDENTITY.md exceeds the persona
+// sub-budget (ADR-0003). Catching here routes through panicFlushAndExit so
+// the failure produces a clean [FATAL persona-startup] log + non-zero exit
+// rather than surfacing only when the first user message arrives.
+try {
+  await loadPersona();
+} catch (err) {
+  panicFlushAndExit("persona-startup", err, 1);
+  // panicFlushAndExit schedules process.exit on a 200ms timer; throw to
+  // halt this script's continued execution in the meantime.
+  throw err;
+}
 
 // Start both Discord bots in parallel (async — doesn't block server startup).
 // A failing Qwen startup (e.g. missing token, bad credentials) must never

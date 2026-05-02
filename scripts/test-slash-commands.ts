@@ -1,16 +1,13 @@
 // Unit tests for parseSlashCommand — pure function, no Discord.
-// Covers: parser precedence (first non-whitespace token only), payload-after-verb
-// extraction, leading separator stripping, no false-positives when the verb
-// appears MID-SENTENCE (e.g. "I want to /cancel my subscription"), recognition
-// of the full /btw|/cancel|/end family, mentioned/unmentioned equivalence (the
-// parser runs on the post-mention-strip body, so this test validates the body
-// shape both forms produce after BotInstance strips).
-//
-// Note on first-token semantics: a message that LITERALLY starts with the
-// verb (e.g. "/end of file is needed") DOES route through with the rest as
-// payload — that's the deliberate parse-shape decision in REVIEW-NOTES.md §1.
-// The "false-positive" class this parser rejects is verb-mid-prose, not
-// verb-first-with-trailing-words. See §5 below.
+// Covers: parser precedence (first non-whitespace token only — prose with
+// the word "end" mid-sentence is NOT a command; prose that BEGINS with
+// `/end <anything>` IS the /end command, payload ignored per CONTEXT.md),
+// payload-after-verb extraction (incl. leading-separator stripping and
+// internal-whitespace preservation for multi-line `/btw`), recognition of
+// the full /btw|/cancel|/end family, mentioned/unmentioned equivalence
+// (the parser runs on the post-mention-strip body, so this test validates
+// the body shape both forms produce after BotInstance strips). See §5 for
+// the /end-as-first-token cases the parser intentionally matches.
 //
 // Run: npx tsx scripts/test-slash-commands.ts
 //
@@ -138,8 +135,8 @@ sect("4. case-insensitive");
 // for ALL three verbs. The "false positive" pattern the brief is
 // protecting against is the verb appearing mid-prose (after other words),
 // which is far more common in conversation than someone literally
-// starting a message with `/end`. See REVIEW-NOTES.md for the deliberate
-// disagreement record if reviewers flag this.
+// starting a message with `/end`. The `/end <anything>` shape is
+// dispatched by /end's handler, which ignores its payload.
 // ---------------------------------------------------------------------------
 sect("5. no false-positives on prose");
 {
@@ -290,6 +287,105 @@ sect("9. /end payload is exposed (caller decides what to do)");
     "payload is exposed verbatim",
     r?.payload === "thanks bye",
     `got ${JSON.stringify(r?.payload)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Boundary character is consumed — punctuation between the verb and the
+//     payload (`:`, `,`, `?`, etc.) must NOT leak into payload. Slice 2
+//     (#15) feeds payload directly into a Claude prompt, so leading
+//     punctuation noise would change the model's input.
+// ---------------------------------------------------------------------------
+sect("10. boundary char does not leak into payload");
+{
+  const r1 = parseSlashCommand("/btw: hi");
+  check(
+    "/btw: hi → payload 'hi' (not ': hi')",
+    r1?.verb === "/btw" && r1?.payload === "hi",
+    `got ${JSON.stringify(r1)}`,
+  );
+  const r2 = parseSlashCommand("/btw, what about X?");
+  check(
+    "/btw, what about X? → payload 'what about X?'",
+    r2?.verb === "/btw" && r2?.payload === "what about X?",
+    `got ${JSON.stringify(r2)}`,
+  );
+  const r3 = parseSlashCommand("/cancel?");
+  check(
+    "/cancel? → payload '' (boundary ? consumed)",
+    r3?.verb === "/cancel" && r3?.payload === "",
+    `got ${JSON.stringify(r3)}`,
+  );
+  const r4 = parseSlashCommand("/end.");
+  check(
+    "/end. → payload '' (boundary . consumed)",
+    r4?.verb === "/end" && r4?.payload === "",
+    `got ${JSON.stringify(r4)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Boundary excludes ASCII word-continuation chars (digits, underscore).
+//     With the looser [^a-z] form, `/end2end` would have parsed as /end
+//     with payload "end" — accidentally clearing the channel mapping.
+//     Section #12 covers the Unicode-aware portion of the same boundary.
+// ---------------------------------------------------------------------------
+sect("11. boundary excludes ASCII digits/underscore");
+{
+  check(
+    "/end2 → null (digit is not a boundary)",
+    parseSlashCommand("/end2") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end2"))}`,
+  );
+  check(
+    "/end2end → null (digit boundary refused)",
+    parseSlashCommand("/end2end") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end2end"))}`,
+  );
+  check(
+    "/cancel123 → null (digit boundary refused)",
+    parseSlashCommand("/cancel123") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancel123"))}`,
+  );
+  check(
+    "/cancel_foo → null (underscore boundary refused)",
+    parseSlashCommand("/cancel_foo") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancel_foo"))}`,
+  );
+  check(
+    "/end_of_file → null (underscore boundary refused)",
+    parseSlashCommand("/end_of_file") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end_of_file"))}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 12. Boundary is Unicode-aware — JS's \W is ASCII-only, so without the
+//     u-flag fix, /endé would have parsed as /end with payload "é".
+// ---------------------------------------------------------------------------
+sect("12. boundary excludes Unicode letters/digits");
+{
+  check(
+    "/endé → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/endé") === null,
+    `got ${JSON.stringify(parseSlashCommand("/endé"))}`,
+  );
+  check(
+    "/cancelñ → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/cancelñ") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancelñ"))}`,
+  );
+  check(
+    "/btw日本 → null (Unicode letter is not a boundary)",
+    parseSlashCommand("/btw日本") === null,
+    `got ${JSON.stringify(parseSlashCommand("/btw日本"))}`,
+  );
+  // Sanity: Unicode in the payload (after a real boundary) is fine.
+  const r = parseSlashCommand("/btw what about 日本?");
+  check(
+    "/btw with Unicode payload → /btw with payload preserved",
+    r?.verb === "/btw" && r?.payload === "what about 日本?",
+    `got ${JSON.stringify(r)}`,
   );
 }
 

@@ -13,11 +13,45 @@
  */
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { estimateTokens } from "./token-estimate.js";
 
 export interface Persona {
   identity: string;
   soul: string;
   memory: string;
+}
+
+// Persona sub-budget from ADR-0003. The combined identity + soul + memory
+// tokens must not exceed this; loadPersona() throws on overrun so the
+// middleware fails fast rather than serving silently inflated prompts.
+export const PERSONA_TOKEN_BUDGET = 1500;
+
+interface PersonaBudgetCheck {
+  ok: boolean;
+  total: number;
+  breakdown: { identity: number; soul: number; memory: number };
+}
+
+function checkPersonaBudget(persona: Persona): PersonaBudgetCheck {
+  const breakdown = {
+    identity: estimateTokens(persona.identity),
+    soul: estimateTokens(persona.soul),
+    memory: estimateTokens(persona.memory),
+  };
+  const total = breakdown.identity + breakdown.soul + breakdown.memory;
+  return { ok: total <= PERSONA_TOKEN_BUDGET, total, breakdown };
+}
+
+function formatBudgetError(c: PersonaBudgetCheck): string {
+  // Format is part of the contract — see scripts/test-persona-budget.ts
+  // and ADR-0003. Per-file breakdown is required so an operator can see
+  // which file to trim without re-running token estimates by hand.
+  return (
+    `persona over budget: ${c.total} tokens, max ${PERSONA_TOKEN_BUDGET}. ` +
+    `Trim SOUL.md/MEMORY.md/IDENTITY.md before retrying. ` +
+    `Per-file breakdown: SOUL.md=${c.breakdown.soul}, ` +
+    `MEMORY.md=${c.breakdown.memory}, IDENTITY.md=${c.breakdown.identity}.`
+  );
 }
 
 const PERSONA_DIR =
@@ -79,7 +113,6 @@ async function readAll(): Promise<{ persona: Persona; mtimes: Record<string, num
 async function refreshIfStale(): Promise<void> {
   const now = Date.now();
   if (_cache && now - _lastCheckAt < TTL_MS) return; // still fresh
-  _lastCheckAt = now;
 
   // Cheap mtime check before re-reading file contents. Only read if any
   // mtime has changed since we last cached.
@@ -98,15 +131,36 @@ async function refreshIfStale(): Promise<void> {
           break;
         }
       }
-      if (!changed) return;
+      if (!changed) {
+        _lastCheckAt = now;
+        return;
+      }
     } catch {
       // Fall through to full reload.
     }
   }
 
   const { persona, mtimes } = await readAll();
+  const check = checkPersonaBudget(persona);
+  if (!check.ok) {
+    // Reload-over-budget is *not* fully fatal at runtime: ADR-0003 scopes
+    // fail-fast to startup, and runQwenTurn's outer try/catch swallows the
+    // throw and surfaces it as a user-facing harness error. We log with a
+    // [FATAL persona] prefix so the supervisor's log scraper still flags
+    // it for the operator to fix, and we deliberately do NOT bump
+    // _lastCheckAt — leaving it stale so the next loadPersona() call
+    // re-attempts the read and re-logs, rather than silently serving
+    // stale persona for a TTL window after a broken edit.
+    if (_cache !== null) {
+      console.error(
+        `[FATAL persona] over budget post-reload: ${check.total} tokens`,
+      );
+    }
+    throw new Error(formatBudgetError(check));
+  }
   _cache = persona;
   _cachedMtimes = mtimes;
+  _lastCheckAt = now;
   console.log(`[qwen-persona] reloaded (${Object.keys(mtimes).length} files)`);
 }
 
@@ -122,4 +176,21 @@ export function getPersonaSync(): Persona {
     );
   }
   return _cache;
+}
+
+// Test-only: reset module state. Smoke scripts call this between cases
+// because _cache / _cachedMtimes / _lastCheckAt are module-level. Not exported
+// from any production index — only used by scripts/test-persona-budget.ts.
+export function _resetCacheForTesting(): void {
+  _cache = null;
+  _cachedMtimes = {};
+  _lastCheckAt = 0;
+}
+
+// Test-only: drop the TTL freshness window so the next loadPersona() call
+// re-runs the mtime check. Preserves _cache and _cachedMtimes — used to
+// simulate a reload (vs. a first-load), which exercises a different code
+// path on budget overrun.
+export function _invalidateTtlForTesting(): void {
+  _lastCheckAt = 0;
 }

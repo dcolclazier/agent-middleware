@@ -42,8 +42,13 @@ writeFileSync(
 // Point the runner at `node` running our hang script. CLAUDE_ARGS will be
 // appended after the script path and ignored by node.
 process.env.CLAUDE_BIN = "node";
-process.env.CLAUDE_BIN_PREFIX_ARGS = hangScript;
+process.env.CLAUDE_BIN_PREFIX_ARG = hangScript;
 process.env.CLAUDE_CWD = tmpDir;
+
+// Isolate the runner's persistence — without this override, createSession()
+// → saveSessions() writes to the repo-local sessions.json and pollutes
+// local dev state with FAKE-SESSION-ID fixtures from these test runs.
+process.env.CLAUDE_SESSIONS_FILE = join(tmpDir, "sessions.json");
 
 const runner = await import("../src/claude-runner.js");
 const { createSession, sendMessage, getSession, cancelTurn, sessionEvents } = runner;
@@ -251,6 +256,68 @@ try {
     );
 
     // Tear down so the test exits cleanly.
+    cancelTurn(sid);
+    await waitFor(() => getSession(sid)?.process === null, 2000, "final teardown");
+  }
+
+  // -------------------------------------------------------------------------
+  // 4. Post-cancel race: a message enqueued in the SIGTERM→close window
+  //    must NOT be silently dropped. cancelTurn() empties the queue
+  //    synchronously and sends SIGTERM; the close handler runs async,
+  //    so a sendMessage() between those two points lands in messageQueue
+  //    while status is still "running". The cancellation short-circuit
+  //    used to clear the queue unconditionally — now it must shift any
+  //    post-cancel entry into the normal resume path.
+  // -------------------------------------------------------------------------
+  sect("4. post-cancel queue drain (SIGTERM→close window)");
+  {
+    const session = createSession("first turn", false, false, null);
+    const sid = session.id;
+    await waitFor(
+      () => getSession(sid)?.claudeSessionId === "FAKE-SESSION-ID-12345",
+      2000,
+      "init captured",
+    );
+
+    // Snapshot the pre-cancel process reference so we can detect when
+    // a NEW spawn replaces it (the resume of the post-cancel follow-up).
+    const preCancelProc = getSession(sid)?.process;
+    check("pre-cancel process is non-null", preCancelProc !== null && preCancelProc !== undefined);
+
+    // Cancel synchronously, then immediately queue a follow-up — close
+    // handler is async so this races into the SIGTERM→close window by
+    // construction (JS is single-threaded; node IPC events fire on a
+    // later tick).
+    cancelTurn(sid);
+    const r = sendMessage(sid, "post-cancel follow-up");
+    check(
+      "follow-up was queued (status was still 'running' pre-close)",
+      r.queued === true,
+      `got ${JSON.stringify(r)}`,
+    );
+
+    // Wait for the close handler to fire AND the post-cancel resume to
+    // re-spawn the process. The terminal state we want: a NEW process
+    // (different reference from preCancelProc) is running.
+    await waitFor(
+      () => {
+        const s = getSession(sid);
+        return s?.process !== null && s?.process !== preCancelProc && s?.status === "running";
+      },
+      3000,
+      "post-cancel resume re-spawned",
+    );
+
+    const after = getSession(sid)!;
+    check("post-cancel resume produced a NEW process (not the cancelled one)", after.process !== preCancelProc);
+    check("status is 'running' on the resumed turn", after.status === "running");
+    check(
+      "claudeSessionId still preserved through the post-cancel resume",
+      after.claudeSessionId === "FAKE-SESSION-ID-12345",
+    );
+    check("messageQueue drained (the follow-up was shifted out)", after.messageQueue.length === 0);
+
+    // Tear down.
     cancelTurn(sid);
     await waitFor(() => getSession(sid)?.process === null, 2000, "final teardown");
   }
