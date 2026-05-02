@@ -150,9 +150,14 @@ const OUTBOUND_MAX_FILES_CAP = 5;
 // clip the body so vLLM doesn't 400). The asymmetry mirrors how
 // `parseThinkingCommand` only honours human authors.
 //
-// 22_000 from ADR-0003 (slice #3 introduces the named constant in
-// qwen-harness.ts). Replace this local copy by importing from qwen-harness
-// once #3 merges.
+// 22_000 from ADR-0003 (= WIRE_HARD_CAP − SYSTEM_BUDGET). src/qwen-harness.ts
+// re-derives and exports the same value under the same name. Dedupe is
+// intentionally deferred: the right fix is to lift WIRE_HARD_CAP /
+// SYSTEM_BUDGET / TURN_BUDGET into a shared constants module rather than
+// have the Discord routing layer import from a Qwen-specific module (that
+// would couple bot-instance.ts to Qwen's harness in the wrong direction).
+// Both sides agree on the value today; if ADR-0003's split changes, the
+// follow-up extraction is the place to keep them in sync.
 export const TURN_BUDGET = 22_000;
 
 /** When a bot author goes over budget, truncate to this fraction of TURN_BUDGET. */
@@ -1344,6 +1349,11 @@ export class BotInstance {
     if (priorChunks.length > 0) {
       content = priorChunks.join("\n\n") + "\n\n" + content;
       console.log(`[${this.displayName}] stitched ${priorChunks.length} prior chunks from ${message.author.username}`);
+      // Re-trim after stitching: priorChunks[0] can carry leading whitespace
+      // that survives the join. Without this, the oversize-turn measurement
+      // (which trims composedBody) would diverge from what the handler
+      // actually receives, letting whitespace tokens slip past the cap.
+      content = content.trim();
     }
 
     if (!content) {
@@ -1384,7 +1394,12 @@ export class BotInstance {
             .map((a) => `[ATTACHMENT: ${a.name}]\n${a.content}\n[/ATTACHMENT]`)
             .join("\n\n") + "\n\n"
         : "";
-    const composedBody = (attachmentBlock + content).trim();
+    // No `.trim()` here: `content` was already trimmed (after mention-strip
+    // and again after priorChunks stitching), and `attachmentBlock` either
+    // ends with `\n\n` or is empty, so the composition has no leading or
+    // trailing whitespace. Trimming again would re-introduce the
+    // measurement / handler-input mismatch this trim discipline avoids.
+    const composedBody = attachmentBlock + content;
     const policy = await this.applyOversizeTurnPolicy(
       message.channel as TextBasedChannel,
       composedBody,
