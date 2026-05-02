@@ -66,7 +66,6 @@ laptop running this service for testing, it's the full local clone.
 
 ## Follow-ups
 
-- ADR-0002 will cover hosting on Spark #2.
 - Retire `qwen-memory.db` (sqlite-vec) in favor of MemPalace once the migration
   is stable. Drops `better-sqlite3` + `sqlite-vec` runtime deps.
 - Update `CLAUDE_MODEL` default from `claude-opus-4-6` to `claude-opus-4-7`

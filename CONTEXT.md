@@ -64,6 +64,41 @@ Block of the form `[ATTACHMENT: name.md] ... [/ATTACHMENT]` parsed out of agent
 output and converted to Discord file attachments. Implementation:
 `src/bot-instance.ts:parseAttachmentSentinels`.
 
+### `/btw`
+Channel slash-command for a **side question** that runs in parallel to an
+in-flight main turn on the same channel. Detected as a `/btw` prefix on the
+post-mention-strip message body in `src/discord-bot.ts:claudeHandler`. Spawns
+an ephemeral **side session** (see below); never resumes the channel's main
+`claudeSessionId`. Capped at one in-flight `/btw` per channel — a second one
+queues with a ⏳ reaction and drains FIFO. Models the "btw, quick question"
+interjection a human collaborator would handle without dropping the main
+thread.
+
+### `/cancel`
+Channel slash-command that interrupts the channel's in-flight Claude turn —
+the analog of Ctrl+C in the Claude Code REPL. SIGTERMs the subprocess,
+preserves `claudeSessionId` (the next message resumes the same Claude
+conversation), drops `messageQueue`, and discards partial output. No-op with
+a ⚠️ reaction if there is nothing to cancel. Distinct from `killSession`
+(`src/claude-runner.ts`), which marks the session errored and orphans it
+from the channel mapping.
+
+### `/end`
+Channel slash-command that closes the channel→session mapping — the analog of
+Ctrl+D in the Claude Code REPL. If a turn is in flight, runs `/cancel`
+internally first. The `Session` row in `sessions.json` is preserved for audit
+(re-resumable via `GET /api/sessions/:id`); only the channel mapping is
+cleared. The next message in the channel falls through to the
+"create new session" path. Payload after `/end` is ignored.
+
+### Side session
+The ephemeral, single-turn `Session` spawned by `/btw`. Created with a fresh
+Claude session id (no `--resume` of the channel's main session — see ADR-0002),
+with a prompt seeded from `fetchChannelContext(...)` plus the main session's
+`lastAssistantText` for read-only awareness of the in-flight context. Single
+turn: discarded after `complete`, not persisted to `sessions.json`. Posts to
+the channel like a normal answer; never overwrites the channel→session mapping.
+
 ## Topology after migration
 
 ```
