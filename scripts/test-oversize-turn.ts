@@ -18,10 +18,10 @@
 
 import {
   BotInstance,
-  TURN_BUDGET,
   evaluateTurnSize,
   splitLeadingAttachmentBlocks,
 } from "../src/bot-instance.js";
+import { TURN_BUDGET } from "../src/wire-budget.js";
 import { estimateTokens } from "../src/token-estimate.js";
 
 let failed = 0;
