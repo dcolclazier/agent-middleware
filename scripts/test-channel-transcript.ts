@@ -95,6 +95,17 @@ function makeBackend(): TranscriptBackend & {
         created_at: d.created_at,
       }));
     },
+    async getDrawer(id) {
+      const d = drawers.find((x) => x.id === id);
+      if (!d) return null;
+      return {
+        id: d.id,
+        text: d.content,
+        wing: d.wing,
+        room: d.room,
+        created_at: d.created_at,
+      };
+    },
     async deleteDrawer(id) {
       const idx = drawers.findIndex((d) => d.id === id);
       if (idx === -1) return false;
@@ -382,6 +393,9 @@ async function main() {
       async listDrawers() {
         throw new Error("backend exploded");
       },
+      async getDrawer() {
+        throw new Error("backend exploded");
+      },
       async deleteDrawer() {
         return false;
       },
@@ -479,6 +493,195 @@ async function main() {
     check(
       "both drawers carry the bot author",
       backend.drawers.every((d) => d.content.includes("ClaudeCode")),
+    );
+    _resetBackendForTesting();
+  }
+
+  // 11. Per-channel mutex: concurrent writeTurns to one channel must not
+  // overlap their add+enforceCap critical sections, even when each call's
+  // backend ops slow-pipe through `await`. Without serialisation the two
+  // calls would interleave list+delete and the cap would drift.
+  sect("11. mutex — concurrent writes to one channel are serialised");
+  {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const recorded: string[] = [];
+    const slowBackend: TranscriptBackend = {
+      async addDrawer(_w, _r, content) {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        recorded.push(`add:${content.match(/"text":"([^"]+)"/)?.[1] ?? "?"}`);
+        await new Promise((res) => setTimeout(res, 5));
+        inFlight--;
+        return { success: true, drawer_id: `id-${recorded.length}` };
+      },
+      async listDrawers() {
+        recorded.push("list");
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    };
+    _setBackendForTesting(slowBackend);
+    await Promise.all([
+      writeTurn(channel, "A", "first", "2026-07-01T00:00:00Z"),
+      writeTurn(channel, "A", "second", "2026-07-01T00:00:01Z"),
+      writeTurn(channel, "A", "third", "2026-07-01T00:00:02Z"),
+    ]);
+    check(
+      "no two writeTurns held the backend concurrently",
+      maxInFlight === 1,
+      `maxInFlight=${maxInFlight}`,
+    );
+    check(
+      "writes hit the backend in submission order",
+      recorded.filter((s) => s.startsWith("add:")).join("|") ===
+        "add:first|add:second|add:third",
+      `recorded=${recorded.join(",")}`,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 12. Preview truncation (Comment #2): when listDrawers' content_preview
+  // is shorter than the full envelope, peekEnvelopeTs must still recover ts
+  // from the prefix so enforceCap evicts the right drawers.
+  sect("12. enforceCap — sorts correctly under preview truncation");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // Manually populate CAP + 5 drawers, descending ts (so insertion order
+    // is opposite of age order — the sort is doing real work). Each
+    // drawer's content is the full envelope but artificially truncated to
+    // 60 chars to simulate a server-side preview cap.
+    const fullEnvelopes: { content: string; truncated: string; ts: string }[] = [];
+    for (let i = 0; i < CHANNEL_TRANSCRIPT_CAP + 5; i++) {
+      const ts = new Date(
+        Date.UTC(2026, 0, 1, 0, 0, CHANNEL_TRANSCRIPT_CAP + 5 - i),
+      ).toISOString();
+      const fullText = "x".repeat(200);
+      const env = JSON.stringify({ v: 1, ts, author: "A", text: fullText });
+      const truncated = env.slice(0, 60);
+      fullEnvelopes.push({ content: env, truncated, ts });
+      backend.drawers.push({
+        id: `pre-${i}`,
+        wing: CHANNEL_TRANSCRIPT_WING,
+        room: channel,
+        content: truncated,
+        created_at: new Date().toISOString(),
+      });
+    }
+    // Trigger eviction via one more writeTurn.
+    await writeTurn(
+      channel,
+      "A",
+      "trigger",
+      "2026-01-02T00:00:00.000Z",
+    );
+    const transcriptDrawers = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    );
+    check(
+      `converges to CAP after one write under preview truncation`,
+      transcriptDrawers.length === CHANNEL_TRANSCRIPT_CAP,
+      `actual=${transcriptDrawers.length}`,
+    );
+    // Oldest 5 (highest indices in fullEnvelopes — those had the smallest
+    // ts because we built ts in reverse) plus the new "trigger" drawer
+    // should determine survivors.
+    const survivedIds = new Set(transcriptDrawers.map((d) => d.id));
+    check(
+      "the trigger drawer survives",
+      survivedIds.size > 0 &&
+        backend.drawers.some(
+          (d) => d.content.includes('"text":"trigger"') && survivedIds.has(d.id),
+        ),
+    );
+    _resetBackendForTesting();
+  }
+
+  // 13. Backlog convergence (Comment #3): if the channel starts above
+  // CAP + 1, one writeTurn should catch us up — not drift one drawer per
+  // write.
+  sect("13. enforceCap — converges from a >CAP+1 backlog in one write");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // Pre-populate 600 valid envelope drawers (CAP + 100).
+    for (let i = 0; i < CHANNEL_TRANSCRIPT_CAP + 100; i++) {
+      const ts = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
+      backend.drawers.push({
+        id: `back-${i}`,
+        wing: CHANNEL_TRANSCRIPT_WING,
+        room: channel,
+        content: JSON.stringify({ v: 1, ts, author: "A", text: "msg " + i }),
+        created_at: ts,
+      });
+    }
+    await writeTurn(
+      channel,
+      "A",
+      "trigger",
+      "2026-01-02T00:00:00.000Z",
+    );
+    const remaining = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    );
+    check(
+      `single write converges 600+1 → ${CHANNEL_TRANSCRIPT_CAP}`,
+      remaining.length === CHANNEL_TRANSCRIPT_CAP,
+      `actual=${remaining.length}`,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 14. NaN-safe sort (Comment #4): a drawer with a malformed ts must not
+  // poison the sort or cause the read path to throw.
+  sect("14. malformed ts — sort is NaN-safe and reads still work");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    backend.drawers.push({
+      id: "bad-ts-1",
+      wing: CHANNEL_TRANSCRIPT_WING,
+      room: channel,
+      content: JSON.stringify({
+        v: 1,
+        ts: "not-a-real-date",
+        author: "A",
+        text: "garbage ts",
+      }),
+      created_at: new Date().toISOString(),
+    });
+    backend.drawers.push({
+      id: "good-ts-1",
+      wing: CHANNEL_TRANSCRIPT_WING,
+      room: channel,
+      content: JSON.stringify({
+        v: 1,
+        ts: "2026-08-01T00:00:00.000Z",
+        author: "A",
+        text: "valid ts",
+      }),
+      created_at: new Date().toISOString(),
+    });
+    let threw = false;
+    let entries: TranscriptEntry[] = [];
+    try {
+      entries = await readVerbatimWindow(channel, "Z", 5);
+    } catch {
+      threw = true;
+    }
+    check("readVerbatimWindow does not throw on malformed ts", !threw);
+    check(
+      "valid-ts entry surfaces in the window",
+      entries.some((e) => e.text === "valid ts"),
     );
     _resetBackendForTesting();
   }

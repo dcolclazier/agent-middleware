@@ -45,6 +45,7 @@
 import {
   isEnabled,
   mpAddDrawer,
+  mpGetDrawer,
   mpListDrawers,
   mpDeleteDrawer,
   mpSearch,
@@ -95,6 +96,13 @@ export interface TranscriptBackend {
     limit?: number;
     offset?: number;
   }): Promise<DrawerEntry[]>;
+  /**
+   * Fetch one drawer's *full* content by id. `listDrawers` returns
+   * `content_preview` (server-truncated) — when the envelope JSON exceeds
+   * that preview, decode fails and we lose the entry. `readVerbatimWindow`
+   * uses this to recover full content for the window it actually returns.
+   */
+  getDrawer(id: string): Promise<DrawerEntry | null>;
   deleteDrawer(id: string): Promise<boolean>;
   search(
     query: string,
@@ -113,6 +121,10 @@ const defaultBackend: TranscriptBackend = {
   },
   async listDrawers(opts) {
     return mpListDrawers(opts);
+  },
+  async getDrawer(id) {
+    const r = await mpGetDrawer(id);
+    return r.drawer ?? null;
   },
   async deleteDrawer(id) {
     return mpDeleteDrawer(id);
@@ -144,13 +156,17 @@ export function _resetBackendForTesting(): void {
 
 interface Envelope {
   v: 1;
-  author: string;
   ts: string;
+  author: string;
   text: string;
 }
 
 function encodeEnvelope(author: string, timestamp: string, text: string): string {
-  const env: Envelope = { v: 1, author, ts: timestamp, text };
+  // Key order is load-bearing: `mpListDrawers` returns a server-truncated
+  // `content_preview`. Putting `ts` and `author` ahead of the (potentially
+  // long) `text` field keeps those fields recoverable by `peekEnvelope*`
+  // even when the preview is truncated mid-`text`.
+  const env: Envelope = { v: 1, ts: timestamp, author, text };
   return JSON.stringify(env);
 }
 
@@ -169,12 +185,38 @@ function decodeEnvelope(content: string): Envelope | null {
       typeof parsed.ts === "string" &&
       typeof parsed.text === "string"
     ) {
-      return { v: 1, author: parsed.author, ts: parsed.ts, text: parsed.text };
+      return { v: 1, ts: parsed.ts, author: parsed.author, text: parsed.text };
     }
   } catch {
     // Not JSON — fall through.
   }
   return null;
+}
+
+/**
+ * Peek at a (possibly preview-truncated) envelope and recover ts as a
+ * millisecond epoch suitable for sorting. `enforceCap` and the sort step in
+ * `readVerbatimWindow` only need ts, so we tolerate truncation here rather
+ * than dropping the entry. Returns 0 (sorts oldest, evicted first) for
+ * undecodable / malformed / NaN-date entries.
+ */
+function peekEnvelopeTs(content: string): number {
+  if (typeof content !== "string" || content.length === 0) return 0;
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed.ts === "string") {
+      const t = new Date(parsed.ts).getTime();
+      return Number.isFinite(t) ? t : 0;
+    }
+  } catch {
+    // Truncated preview — fall through to regex fallback.
+  }
+  const m = content.match(/"ts"\s*:\s*"([^"]+)"/);
+  if (m && m[1]) {
+    const t = new Date(m[1]).getTime();
+    return Number.isFinite(t) ? t : 0;
+  }
+  return 0;
 }
 
 function entryFromDrawer(d: DrawerEntry): TranscriptEntry | null {
@@ -200,6 +242,36 @@ function entryFromSearchResult(r: SearchResult): TranscriptEntry | null {
 }
 
 // ---------------------------------------------------------------------------
+// Per-channel write serialisation. The Discord layer fires `writeTurn` calls
+// without awaiting them (`void transcribeIncoming(...)` in bot-instance.ts),
+// so two messages in the same channel can have overlapping
+// add → enforceCap → list → delete sequences. Without serialisation the cap
+// drifts above CHANNEL_TRANSCRIPT_CAP and ADR-0004's "atomic eviction"
+// contract breaks. We chain each channel's writes through a per-channel
+// promise so add+enforceCap is mutually exclusive within a process.
+// ---------------------------------------------------------------------------
+
+const channelLocks = new Map<string, Promise<void>>();
+
+function withChannelLock<T>(
+  channelId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = channelLocks.get(channelId) ?? Promise.resolve();
+  const result = prev.then(() => fn());
+  // Swallow rejection on the lock chain so one failed write doesn't poison
+  // every subsequent write for that channel.
+  channelLocks.set(
+    channelId,
+    result.then(
+      () => {},
+      () => {},
+    ),
+  );
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -209,9 +281,10 @@ function entryFromSearchResult(r: SearchResult): TranscriptEntry | null {
  * Writes a drawer to `wing="conversation"`, `room=channelId` whose content
  * is a JSON envelope of {author, timestamp, text}. After the write, if the
  * channel now holds more than CHANNEL_TRANSCRIPT_CAP transcript drawers,
- * the oldest are deleted (drop-oldest-on-write). Failure paths (write or
- * delete) are logged but never thrown — transcript capture must not break
- * the bot's reply path.
+ * the oldest are deleted (drop-oldest-on-write). Add and cap-enforcement
+ * are serialised per channel (see `withChannelLock`). Failure paths (write
+ * or delete) are logged but never thrown — transcript capture must not
+ * break the bot's reply path.
  *
  * No-op when MEMPALACE_ENABLED is not "true".
  */
@@ -222,24 +295,26 @@ export async function writeTurn(
   timestamp: string,
 ): Promise<void> {
   if (!isEnabled()) return;
-  try {
-    const content = encodeEnvelope(author, timestamp, text);
-    const result = await backend.addDrawer(
-      CHANNEL_TRANSCRIPT_WING,
-      channelId,
-      content,
-    );
-    if (!result.success) {
-      console.error(
-        `[channel-transcript] addDrawer failed for room=${channelId}: ${result.error ?? "unknown"}`,
+  return withChannelLock(channelId, async () => {
+    try {
+      const content = encodeEnvelope(author, timestamp, text);
+      const result = await backend.addDrawer(
+        CHANNEL_TRANSCRIPT_WING,
+        channelId,
+        content,
       );
-      return;
+      if (!result.success) {
+        console.error(
+          `[channel-transcript] addDrawer failed for room=${channelId}: ${result.error ?? "unknown"}`,
+        );
+        return;
+      }
+      await enforceCap(channelId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[channel-transcript] writeTurn failed: ${msg}`);
     }
-    await enforceCap(channelId);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[channel-transcript] writeTurn failed: ${msg}`);
-  }
+  });
 }
 
 /**
@@ -264,17 +339,36 @@ export async function readVerbatimWindow(
       room: channelId,
       limit: CHANNEL_TRANSCRIPT_CAP,
     });
-    const entries = drawers
-      .map(entryFromDrawer)
-      .filter((e): e is TranscriptEntry => e !== null)
-      .filter((e) => e.author !== excludeAuthor);
-    // Sort oldest-to-newest by timestamp.
-    entries.sort(
-      (a, b) =>
-        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-    );
-    // Take the last k (most recent).
-    return entries.slice(-k);
+    // List returns content_preview, so envelope.text may be truncated and
+    // decodeEnvelope may return null. Sort by ts (peeked from the truncated
+    // preview) before slicing, then re-fetch full content for the K we
+    // actually return.
+    const annotatedAuthors = drawers
+      .map((d) => {
+        const m = d.text.match(/"author"\s*:\s*"([^"]+)"/);
+        const author = m && m[1] ? m[1] : "";
+        return { d, ts: peekEnvelopeTs(d.text), author };
+      })
+      .filter((a) => a.author !== "" && a.author !== excludeAuthor);
+    annotatedAuthors.sort((a, b) => a.ts - b.ts);
+    const candidates = annotatedAuthors.slice(-k);
+
+    // Resolve each candidate to a full TranscriptEntry. Try the preview
+    // first (cheap path — succeeds whenever the envelope fit in the
+    // preview); fall back to a single-drawer GET when JSON.parse fails.
+    const entries: TranscriptEntry[] = [];
+    for (const a of candidates) {
+      const fromPreview = entryFromDrawer(a.d);
+      if (fromPreview) {
+        entries.push(fromPreview);
+        continue;
+      }
+      const full = await backend.getDrawer(a.d.id);
+      if (!full) continue;
+      const fromFull = entryFromDrawer(full);
+      if (fromFull) entries.push(fromFull);
+    }
+    return entries;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[channel-transcript] readVerbatimWindow failed: ${msg}`);
@@ -395,22 +489,21 @@ export async function transcribeOutgoing(
  * room=channelId, so fact drawers are out of scope by construction.
  */
 async function enforceCap(channelId: string): Promise<void> {
-  // Fetch one over the cap to detect the overflow condition.
+  // List with generous slack so any real-world backlog (existing data,
+  // delete failures from prior runs, multi-process writes pre-mutex) is
+  // catchable in one pass — the previous CAP+1 limit could only delete one
+  // drawer per write, never converging if the channel was further over.
   const drawers = await backend.listDrawers({
     wing: CHANNEL_TRANSCRIPT_WING,
     room: channelId,
-    limit: CHANNEL_TRANSCRIPT_CAP + 1,
+    limit: CHANNEL_TRANSCRIPT_CAP * 2 + 1,
   });
   if (drawers.length <= CHANNEL_TRANSCRIPT_CAP) return;
 
-  // Order oldest-first by timestamp from the envelope (falls back to
-  // listing order for legacy/undecodable entries — those go first so they
-  // are the first evicted).
-  const annotated = drawers.map((d) => {
-    const env = decodeEnvelope(d.text);
-    const ts = env ? new Date(env.ts).getTime() : 0;
-    return { d, ts };
-  });
+  // Order oldest-first by ts peeked from the (possibly preview-truncated)
+  // envelope. peekEnvelopeTs returns 0 for undecodable / NaN-date / missing
+  // ts entries — those sort first so they're the first evicted.
+  const annotated = drawers.map((d) => ({ d, ts: peekEnvelopeTs(d.text) }));
   annotated.sort((a, b) => a.ts - b.ts);
 
   const overflow = annotated.length - CHANNEL_TRANSCRIPT_CAP;
