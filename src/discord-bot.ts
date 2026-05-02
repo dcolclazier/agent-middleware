@@ -122,6 +122,17 @@ const claudeHandler: BotMessageHandler = async (
         // whether postToDiscord prepends a mention reply — for /btw from a
         // human, that's no mention; for /btw from a bot, it's an @reply.
         self.setTrigger(sideSessionId, trigger);
+        // createSession emits `status:running` synchronously inside
+        // enqueueSideTurn — that fires BEFORE this .then() microtask, so the
+        // global status listener (which bails when no trigger is bound) misses
+        // the running transition and would otherwise skip 🧑‍💻 for /btw.
+        // Reconcile by sampling current status here. Subsequent transitions
+        // (complete / error) fire from the subprocess close handler, AFTER
+        // setTrigger has run, and land via the listener normally.
+        const sideSession = getSession(sideSessionId);
+        if (sideSession?.status === "running") {
+          void safeReact("🧑‍💻");
+        }
       })
       .catch((err) => {
         console.error(`[ClaudeCode] /btw side-session dispatch failed: ${err}`);
