@@ -181,13 +181,22 @@ export function _resetBackendForTesting(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Memory-offline warning (issue #8). Channel-transcript is the single
-// integration point for MemPalace calls scoped to a Discord channel
-// (writeTurn / readVerbatimWindow / searchProse), which is why the warning
-// logic lives here rather than in mempalace-client.ts: the client speaks
-// MemPalace primitives, not channels, so it has no place to track per-channel
-// outage state. The brief authorises either location; channel-transcript is
-// preferred precisely because it already owns the channelId boundary.
+// Memory-offline warning (issue #8). Channel-transcript is the integration
+// point for MemPalace calls scoped to a Discord channel; the warning logic
+// lives here (rather than in mempalace-client.ts) because the client speaks
+// MemPalace primitives, not channels, and so has no place to track
+// per-channel outage state. The brief authorises either location;
+// channel-transcript is preferred because it already owns the channelId
+// boundary.
+//
+// Reporting points: writeTurn (failure on every Discord message routed
+// through bot-instance) and searchProse (failure on a channel-scoped
+// topical query). readVerbatimWindow does NOT report — verbatim reads
+// happen on the response path, after writeTurn has already fired the
+// warning for the same outage. Wiring reads in too would only matter for
+// the corner case of "MP went down strictly between writeTurn-success and
+// readVerbatimWindow on the same turn," and the next writeTurn/searchProse
+// would catch it. Issue #8 covers the dominant first-failure path.
 //
 // State: per-channel "warning has been posted in this outage" flag. On the
 // next successful call the flag clears so a subsequent outage re-fires once.
