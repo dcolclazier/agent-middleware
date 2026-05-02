@@ -395,8 +395,8 @@ function hasStandbySentinel(content: string): boolean {
 //        emitter: BotInstance.handleMessage; discord-bot.ts
 //   🛑  bot disabled by user kill-switch command
 //        emitter: BotInstance.handleMessage
-//   🤔  thinking — a Claude turn has been queued/sent or a /btw was
-//        recognised (Slice 2 will refine /btw's reaction set)
+//   🤔  thinking — a Claude turn has been queued/sent OR a /btw was
+//        accepted to spawn immediately (CONTEXT.md → /btw)
 //        emitter: discord-bot.ts (claudeHandler)
 //   🧑‍💻 Claude subprocess transitioned to "running"
 //        emitter: discord-bot.ts (status listener)
@@ -410,9 +410,9 @@ function hasStandbySentinel(content: string): boolean {
 //        emitter: discord-bot.ts (claudeHandler)
 //   👋  /end confirmed — channel→session mapping cleared (CONTEXT.md → /end)
 //        emitter: discord-bot.ts (claudeHandler)
-//
-// Slice 2 (issue #15) will add ⏳ for "/btw queued behind another side
-// turn" once /btw's dispatch path lands.
+//   ⏳  /btw queued behind another in-flight side session for the same
+//        channel (CONTEXT.md → /btw, Side session); will drain FIFO
+//        emitter: discord-bot.ts (claudeHandler)
 
 // --- Class ---
 

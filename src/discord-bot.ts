@@ -14,6 +14,7 @@ import {
   type ReadAttachment,
 } from "./bot-instance.js";
 import { parseSlashCommand } from "./slash-commands.js";
+import { enqueueSideTurn } from "./side-session.js";
 
 // --- Shared state across all bots in this process ---
 // Each BotInstance adds its own user id to this set on ClientReady so no
@@ -90,12 +91,40 @@ const claudeHandler: BotMessageHandler = async (
       await safeReact("👋");
       return;
     }
-    // /btw — Slice 2 (issue #15) wires the side-session dispatch. For now
-    // we ack with 🤔 ("noticed your message") and otherwise no-op so we
-    // don't accidentally treat the /btw payload as a main-turn prompt.
-    // This matches the brief's "no-op or 'not yet' reaction is
-    // acceptable" allowance.
-    await safeReact("🤔");
+    // /btw — spawn an ephemeral side session that runs in parallel to the
+    // main turn. ADR-0002: fresh Claude session id (NOT a --resume of the
+    // main session). At most ONE in-flight side session per channel; a
+    // second /btw queues with ⏳ and drains FIFO. The side session posts
+    // its answer to the channel via the existing post-to-discord listener
+    // and never overwrites the channel→Session mapping.
+    //
+    // The trigger we register here is for the side session id, NOT the
+    // main session id — that way the existing status / post-to-discord
+    // listeners (which key on session id, not main-vs-side) emit
+    // 🧑‍💻 / 🔥 / 💥 / ✅ on the side-session's own /btw message.
+    //
+    // We swallow errors from enqueueSideTurn so a thrown promise rejection
+    // doesn't take down the message handler. Failures are visible via the
+    // 💥 reaction the existing status listener emits on session "error".
+    enqueueSideTurn({
+      channelId,
+      payload: slash.payload,
+      channelHistoryProvider: () => self.fetchChannelContext(channelId, message.id, 30),
+      mainSessionLookup: () => self.getSessionForChannel(channelId),
+      onAck: () => { void safeReact("🤔"); },
+      onQueued: () => { void safeReact("⏳"); },
+    })
+      .then((sideSessionId) => {
+        // Bind reactions/post-to-discord for THIS side session to the /btw
+        // message that triggered it. The trigger's authorIsBot flag drives
+        // whether postToDiscord prepends a mention reply — for /btw from a
+        // human, that's no mention; for /btw from a bot, it's an @reply.
+        self.setTrigger(sideSessionId, trigger);
+      })
+      .catch((err) => {
+        console.error(`[ClaudeCode] /btw side-session dispatch failed: ${err}`);
+        void safeReact("💥");
+      });
     return;
   }
 

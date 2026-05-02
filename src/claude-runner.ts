@@ -37,6 +37,16 @@ export interface Session {
    * this enforces.
    */
   cancelled?: boolean;
+  /**
+   * When true, this session is held in the in-memory `sessions` map for the
+   * duration of its single turn but is NEVER written to `sessions.json`
+   * (saveSessions skips it) and is removed from the map on terminal status
+   * (`complete` / `error`). Used by `/btw` side sessions per ADR-0002 — the
+   * side session is single-turn and intentionally has no persistence
+   * footprint. The post-to-discord event still fires so the channel reply
+   * lands; only the persistence + lifetime change.
+   */
+  ephemeral?: boolean;
 }
 
 interface StreamEvent {
@@ -77,7 +87,13 @@ interface PersistedSession {
 }
 
 export function saveSessions() {
-  const data: PersistedSession[] = Array.from(sessions.values()).map((s) => ({
+  // Ephemeral sessions (e.g. /btw side sessions) are intentionally excluded
+  // from persistence — they are single-turn and discarded on terminal
+  // status, so leaving them in sessions.json would leak state across
+  // restarts for sessions whose subprocess no longer exists. See ADR-0002.
+  const data: PersistedSession[] = Array.from(sessions.values())
+    .filter((s) => !s.ephemeral)
+    .map((s) => ({
     id: s.id,
     claudeSessionId: s.claudeSessionId,
     status: s.process ? "running" as const : s.status,  // if process alive, mark running; otherwise keep status
@@ -340,7 +356,7 @@ export function createSession(
   autoResume = false,
   webhook = false,
   callbackSessionKey: string | null = null,
-  opts: { suppressDiscordPost?: boolean } = {},
+  opts: { suppressDiscordPost?: boolean; ephemeral?: boolean } = {},
 ): Session {
   const id = crypto.randomUUID();
 
@@ -362,6 +378,7 @@ export function createSession(
     webhook,
     callbackSessionKey,
     suppressDiscordPost: opts.suppressDiscordPost === true,
+    ephemeral: opts.ephemeral === true,
   };
 
   attachProcessHandlers(session, proc);
