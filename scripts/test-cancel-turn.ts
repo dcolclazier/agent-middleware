@@ -45,6 +45,11 @@ process.env.CLAUDE_BIN = "node";
 process.env.CLAUDE_BIN_PREFIX_ARG = hangScript;
 process.env.CLAUDE_CWD = tmpDir;
 
+// Isolate the runner's persistence — without this override, createSession()
+// → saveSessions() writes to the repo-local sessions.json and pollutes
+// local dev state with FAKE-SESSION-ID fixtures from these test runs.
+process.env.CLAUDE_SESSIONS_FILE = join(tmpDir, "sessions.json");
+
 const runner = await import("../src/claude-runner.js");
 const { createSession, sendMessage, getSession, cancelTurn, sessionEvents } = runner;
 

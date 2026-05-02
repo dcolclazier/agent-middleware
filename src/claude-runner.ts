@@ -62,7 +62,14 @@ sessionEvents.setMaxListeners(50);
 
 // --- Persistence ---
 
-const SESSIONS_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "sessions.json");
+// Persistent state file for Session metadata. Defaults to a repo-relative
+// path for local development; production deployments and tests should set
+// `CLAUDE_SESSIONS_FILE` to point at a writable location outside the repo
+// (per CLAUDE.md → "All persistent state paths come from env vars"). Tests
+// in particular MUST override this to avoid polluting the repo-local
+// sessions.json with fake fixtures.
+const SESSIONS_FILE = process.env.CLAUDE_SESSIONS_FILE
+  || join(dirname(fileURLToPath(import.meta.url)), "..", "sessions.json");
 
 interface PersistedSession {
   id: string;
