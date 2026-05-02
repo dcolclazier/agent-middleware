@@ -1250,6 +1250,86 @@ async function main() {
     _resetBackendForTesting();
   }
 
+  // 25. Memory-offline warning — global searchProse (no channelId) does NOT
+  // touch the per-channel offline state. There's no channel to attribute the
+  // failure to, and global searches shouldn't accidentally clear another
+  // channel's outage flag.
+  sect("25. memory-offline warning — searchProse without channelId is silent");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: true, drawer_id: "x" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        throw new Error("global search down");
+      },
+    });
+    // Failed search WITHOUT channelId — should NOT fire warning.
+    const r = await searchProse("anything"); // no channelId
+    check("global search returned []", Array.isArray(r) && r.length === 0);
+    check(
+      "global search failure did NOT fire warning",
+      notifications.length === 0,
+      `actual=${notifications.length}`,
+    );
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 26. Memory-offline warning — setMemoryOfflineNotifier(null) clears the
+  // notifier; subsequent failures log but do not invoke any callback.
+  sect("26. memory-offline warning — setMemoryOfflineNotifier(null) disables");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    let invoked = 0;
+    setMemoryOfflineNotifier(() => {
+      invoked++;
+    });
+    setMemoryOfflineNotifier(null);
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    await writeTurn(channel, "A", "x", "2026-12-15T00:00:00Z");
+    check(
+      "after setMemoryOfflineNotifier(null), prior callback not invoked",
+      invoked === 0,
+      `invoked=${invoked}`,
+    );
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
   console.log(`\n======\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }
