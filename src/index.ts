@@ -1,3 +1,8 @@
+// `.env` must be parsed BEFORE any other module is imported, because many
+// modules (qwen-persona, claude-runner, mempalace-client, ...) capture
+// `process.env.*` at module-init time. See bootstrap-env.ts.
+import "./bootstrap-env.js";
+
 import express from "express";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "url";
@@ -27,26 +32,7 @@ import {
   type Agent,
 } from "./canon-commit.js";
 import { runQwenTurn, getQwenSession } from "./qwen-harness.js";
-
-// Load .env manually (no dotenv dependency)
-import { readFileSync } from "fs";
-try {
-  const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
-  const envContent = readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim();
-    if (!process.env[key]) {
-      process.env[key] = value;
-    }
-  }
-} catch {
-  // .env is optional
-}
+import { loadPersona } from "./qwen-persona.js";
 
 // --- Process-level crash safety ---
 //
@@ -112,6 +98,20 @@ process.on("SIGINT", () => {
 
 // Restore persisted sessions before starting
 loadSessions();
+
+// Validate persona budget before any bot or HTTP listener starts. loadPersona()
+// throws if the combined SOUL.md/MEMORY.md/IDENTITY.md exceeds the persona
+// sub-budget (ADR-0003). Catching here routes through panicFlushAndExit so
+// the failure produces a clean [FATAL persona-startup] log + non-zero exit
+// rather than surfacing only when the first user message arrives.
+try {
+  await loadPersona();
+} catch (err) {
+  panicFlushAndExit("persona-startup", err, 1);
+  // panicFlushAndExit schedules process.exit on a 200ms timer; throw to
+  // halt this script's continued execution in the meantime.
+  throw err;
+}
 
 // Start both Discord bots in parallel (async — doesn't block server startup).
 // A failing Qwen startup (e.g. missing token, bad credentials) must never
@@ -557,6 +557,18 @@ app.post("/api/qwen/test", canonAuth, async (req, res) => {
   try {
     const result = await runQwenTurn(channelId, prompt);
     const session = await getQwenSession(channelId);
+    // ADR-0003: surface per-turn wire budget metrics for the request that
+    // was actually sent (post-compression, post-pre-flight). Defaults to
+    // 0 when the turn ended without any successful chat() call (e.g. a
+    // pre-error path).
+    const wb = result.wireBudget ?? {
+      systemPromptTokens: 0,
+      messagesTokens: 0,
+      overlayTokens: 0,
+      totalWireTokens: 0,
+      headroomToHardCap: 0,
+      headroomToSystemBudget: 0,
+    };
     res.json({
       sessionId: result.sessionId,
       finalText: result.finalText,
@@ -564,6 +576,14 @@ app.post("/api/qwen/test", canonAuth, async (req, res) => {
       turns: result.turns,
       messageCount: session ? session.messages.length : 0,
       toolFailures: session ? session.toolFailures : {},
+      systemPromptTokens: wb.systemPromptTokens,
+      messagesTokens: wb.messagesTokens,
+      totalWireTokens: wb.totalWireTokens,
+      headroomToHardCap: wb.headroomToHardCap,
+      headroomToSystemBudget: wb.headroomToSystemBudget,
+      // Optional structured error block (present iff stopReason==="error"
+      // due to wire-budget exceedance).
+      error: result.error,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

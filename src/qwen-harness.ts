@@ -56,7 +56,54 @@ const WALL_CLOCK_MS = parseInt(
   10,
 );
 const PER_TOOL_FAILURE_CAP = 2;
-const CONTEXT_SOFT_LIMIT_TOKENS = 25_000; // vLLM max_model_len is 32k; leave headroom.
+
+// ---------------------------------------------------------------------------
+// Wire budget — ADR-0003 hard wire cap with system-prompt sub-budgets.
+// ---------------------------------------------------------------------------
+//
+// Replaces the earlier `CONTEXT_SOFT_LIMIT_TOKENS = 25_000` soft target which
+// also explicitly preserved the last turn group "even if it alone exceeded
+// the soft limit." That contract did not actually guarantee the user's
+// requirement of "never hit vLLM's 32k window" — large user pastes or single
+// giant tool results bypassed the cap.
+//
+// New contract:
+//   - WIRE_HARD_CAP is the absolute ceiling for any outgoing chat() request,
+//     measured AFTER overlay hydration. Compression targets TURN_BUDGET for
+//     the messages array; pre-flight refuses to send if the full request
+//     (system prompt + messages + overlay) is still over WIRE_HARD_CAP.
+//   - We preserve the last turn group up to TURN_BUDGET (not unconditionally).
+//     If after one extra compression pass the request is still over, we fail
+//     at pre-flight and return a structured `error` stop reason.
+//
+// vLLM max_model_len for Qwen3-235B = 32_768; the 2k margin between
+// WIRE_HARD_CAP and the model ceiling is tokenizer-drift insurance.
+export const WIRE_HARD_CAP = 30_000;
+export const SYSTEM_BUDGET = 8_000;
+export const TURN_BUDGET = WIRE_HARD_CAP - SYSTEM_BUDGET; // 22_000
+
+// SYSTEM_BUDGET sub-allocations — sum MUST equal SYSTEM_BUDGET. See
+// docs/adr/0003-hard-wire-cap-and-system-budget.md for the rationale
+// behind each slot's size. Slots are consumed by their respective
+// system-prompt assemblers (mpSearchAsString and friends), usually via a
+// chars-per-token conversion of ~3.5 chars/token (matches token-estimate.ts
+// fallback). Helper: `tokensToChars()` below.
+export const PERSONA_BUDGET = 1_500;
+export const TOOLS_INSTRUCTIONS_BUDGET = 1_000;
+export const CHANNEL_STATE_BUDGET = 500;
+export const VERBATIM_WINDOW_BUDGET = 2_500;
+export const TOPICAL_DECISIONS_BUDGET = 1_500;
+export const TOPICAL_PROSE_BUDGET = 500;
+export const SYSTEM_BUDGET_MARGIN = 500;
+
+// Conservative chars-per-token estimate for budget-driven char caps fed to
+// assemblers like mpSearchAsString. Mirrors token-estimate.ts's fallback
+// (chars/3.5) — i.e. denser than the chars/4 rule of thumb because Qwen's
+// tokenizer is dense on JSON/XML.
+const CHARS_PER_TOKEN = 3.5;
+function tokensToChars(tokens: number): number {
+  return Math.floor(tokens * CHARS_PER_TOKEN);
+}
 // Upper bound on a persisted tool-result body in session.messages. The CURRENT
 // turn still reasons over the full result via an in-memory overlay, but what
 // gets stored for future-turn replay is truncated to a stub + 200-char preview.
@@ -73,8 +120,9 @@ const TOOL_RESULT_HISTORY_MAX_BYTES = 4096;
 // vLLM received hydrated content). When the overlay exceeds this cap the
 // compression pass evicts the oldest overlay entries first — the stubs stay
 // in session.messages, just without their overlay-expanded full bodies.
-// 60000 ≈ 15k tokens, leaving ~10k for system prompt + current turn prose
-// inside the 25k soft limit.
+// 60000 ≈ 15k tokens, leaving ~7k for the rest of TURN_BUDGET (=22k).
+// Stage 0 cap on the overlay alone — Stage 1 then trims further to keep the
+// full wire estimate (sys prompt + messages + overlay) under WIRE_HARD_CAP.
 const OVERLAY_SOFT_BYTES = 60_000;
 // Layer C — rolling window. After end-of-turn fact extraction (Layer B),
 // session.messages is trimmed to the most recent N user/assistant turn
@@ -143,6 +191,34 @@ export interface RunResult {
     | "error";
   turns: number;
   sessionId: string;
+  /**
+   * Per-turn wire budget metrics measured for the request that was actually
+   * sent (post-compression, post-pre-flight). Populated on the smoke endpoint
+   * path; absent if no chat() call was made (e.g. immediate pre-flight
+   * failure on a turn that bailed before a successful send). The smoke
+   * endpoint also re-measures these after the loop ends; this field is the
+   * canonical source for the five new endpoint fields.
+   */
+  wireBudget?: {
+    systemPromptTokens: number;
+    messagesTokens: number;
+    overlayTokens: number;
+    totalWireTokens: number;
+    headroomToHardCap: number;
+    headroomToSystemBudget: number;
+  };
+  /**
+   * Structured error payload for stopReason === "error" cases caused by
+   * pre-flight wire-budget failure (the payload could not be compressed
+   * to fit under WIRE_HARD_CAP after one extra pass). Other "error" causes
+   * leave this undefined.
+   */
+  error?: {
+    kind: "wire_budget_exceeded";
+    message: string;
+    estimatedTokens: number;
+    breakdown: WireBudgetBreakdown;
+  };
 }
 
 // --- task_complete attachment validation ---
@@ -751,15 +827,24 @@ function buildSystemPrompt(opts: {
  * count those bytes because the wire cost (to vLLM) is the hydrated form,
  * not the stubbed `session.messages` form.
  *
+ * Targets TURN_BUDGET (22k tokens) for the messages-plus-overlay portion of
+ * the wire request — the system prompt is bounded separately by
+ * SYSTEM_BUDGET, so trimming messages to TURN_BUDGET leaves enough headroom
+ * for the system prompt to land the total under WIRE_HARD_CAP. Pre-flight
+ * (validateWireBudget) re-checks the full wire estimate after compression.
+ *
  * Eviction order (cheapest semantic loss first):
  *   1. Drop the oldest overlay entries. The matching stub stays in
  *      session.messages — Qwen loses the ability to reason over the full
  *      prior tool result but still sees the preview + byte count.
- *   2. Only if dropping ALL overlay entries still leaves us over the soft
- *      limit, fall through to dropping whole turn groups (oldest first).
+ *   2. Only if dropping ALL overlay entries still leaves us over the
+ *      TURN_BUDGET, fall through to dropping whole turn groups (oldest
+ *      first).
  *
- * The LAST turn group (containing the latest user message) is always
- * preserved, even if it alone exceeds the soft limit.
+ * The last turn group is preserved up to TURN_BUDGET. If a single turn
+ * group alone exceeds TURN_BUDGET, compression cannot help — pre-flight
+ * (validateWireBudget) will reject and runQwenTurn returns a structured
+ * `error` stop reason.
  *
  * This replaces the earlier bug where compression measured `session.messages`
  * byte cost (stubs) while vLLM received the overlay-hydrated wire payload.
@@ -858,12 +943,14 @@ export async function compressOldMessages(
     }
   };
 
-  // Estimate the wire cost: stubs in session.messages PLUS the overlay's
-  // contribution (each live overlay entry replaces the stub's content at
-  // send time, so we need overlay_bytes - stub_bytes more than the stubbed
-  // count — approximate as overlay_bytes since stubs are small).
-  const estimateWire = (): number => {
-    let text = systemPrompt;
+  // Estimate the messages-plus-overlay wire cost (i.e. everything OTHER than
+  // the system prompt). Compression targets TURN_BUDGET on this number;
+  // pre-flight (validateWireBudget) re-checks system + messages + overlay
+  // against WIRE_HARD_CAP after compression returns. The system prompt is
+  // bounded separately by SYSTEM_BUDGET so it doesn't need to be in the
+  // compression target.
+  const estimateMessages = (): number => {
+    let text = "";
     for (const m of session.messages) text += JSON.stringify(m);
     // Add overlay bytes for entries still referenced. Dead orphans get
     // pruned before estimation.
@@ -877,6 +964,9 @@ export async function compressOldMessages(
     }
     return estimateTokens(text);
   };
+  // Kept for back-compat with older log lines; same answer plus systemPrompt.
+  const estimateWire = (): number =>
+    estimateMessages() + estimateTokens(systemPrompt);
 
   pruneOrphans();
 
@@ -923,19 +1013,20 @@ export async function compressOldMessages(
     );
   }
 
-  if (estimateWire() <= CONTEXT_SOFT_LIMIT_TOKENS) {
+  if (estimateMessages() <= TURN_BUDGET) {
     if (evictedForSoftBytes > 0) {
       console.log(
-        `[qwen-harness.compressOldMessages] Stage 0 drained overlay by ${evictedForSoftBytes} entr${evictedForSoftBytes === 1 ? "y" : "ies"}; now under soft limit`,
+        `[qwen-harness.compressOldMessages] Stage 0 drained overlay by ${evictedForSoftBytes} entr${evictedForSoftBytes === 1 ? "y" : "ies"}; now under TURN_BUDGET`,
       );
     }
     return;
   }
 
-  // Stage 1: evict oldest overlay entries until the wire estimate is
-  // under the token soft limit.
+  // Stage 1: evict oldest overlay entries until the messages+overlay estimate
+  // is under TURN_BUDGET. Pre-flight (validateWireBudget) then re-checks the
+  // full request against WIRE_HARD_CAP.
   let evictedForTokens = 0;
-  while (estimateWire() > CONTEXT_SOFT_LIMIT_TOKENS) {
+  while (estimateMessages() > TURN_BUDGET) {
     const ordered = orderedOverlayIds();
     if (ordered.length === 0) break;
     const victim = ordered[0]!;
@@ -944,28 +1035,33 @@ export async function compressOldMessages(
     overlay.delete(victim);
     evictedForTokens++;
     console.log(
-      `[qwen-harness.compressOldMessages] Stage 1 evict overlay[${victim}] (${victimBytes}B) — wire estimate over ${CONTEXT_SOFT_LIMIT_TOKENS} tokens`,
+      `[qwen-harness.compressOldMessages] Stage 1 evict overlay[${victim}] (${victimBytes}B) — messages+overlay over TURN_BUDGET=${TURN_BUDGET}`,
     );
   }
-  if (estimateWire() <= CONTEXT_SOFT_LIMIT_TOKENS) {
+  if (estimateMessages() <= TURN_BUDGET) {
     console.log(
-      `[qwen-harness.compressOldMessages] Stage 0+1 evicted ${evictedForSoftBytes + evictedForTokens} overlay entr${evictedForSoftBytes + evictedForTokens === 1 ? "y" : "ies"}; now under soft limit`,
+      `[qwen-harness.compressOldMessages] Stage 0+1 evicted ${evictedForSoftBytes + evictedForTokens} overlay entr${evictedForSoftBytes + evictedForTokens === 1 ? "y" : "ies"}; now under TURN_BUDGET`,
     );
     return;
   }
 
-  // Stage 2: still over budget with zero overlay entries. Drop whole turn
-  // groups from the oldest (user-message seam) boundary.
+  // Stage 2: still over TURN_BUDGET with zero overlay entries. Drop whole
+  // turn groups from the oldest (user-message seam) boundary.
+  //
+  // Contract change vs. the old soft-limit world: we now keep dropping while
+  // we are over budget, including the case where dropping leaves just one
+  // user-message turn group. If THAT remaining turn group is still over
+  // TURN_BUDGET on its own, we cannot compress further — pre-flight
+  // (validateWireBudget) will then reject and runQwenTurn returns a
+  // structured `error` stop reason instead of silently overflowing vLLM.
   const userIdxs: number[] = [];
   for (let i = 0; i < session.messages.length; i++) {
     if ((session.messages[i] as { role?: string })?.role === "user") {
       userIdxs.push(i);
     }
   }
-  // Nothing to drop if we have 0 or 1 user messages — compression would
-  // break the latest turn group.
   let droppedGroups = 0;
-  while (estimateWire() > CONTEXT_SOFT_LIMIT_TOKENS && userIdxs.length > 1) {
+  while (estimateMessages() > TURN_BUDGET && userIdxs.length > 1) {
     const nextUserStart = userIdxs[1]!;
     const dropCount = nextUserStart;
     session.messages.splice(0, dropCount);
@@ -988,6 +1084,90 @@ export async function compressOldMessages(
       `[qwen-harness.compressOldMessages] Stage 2 total: ${droppedGroups} turn group(s) dropped`,
     );
   }
+  // Note: if estimateMessages() is still > TURN_BUDGET here (single turn
+  // group too large), we fall through silently — pre-flight (validateWireBudget
+  // in runQwenTurn) is the gate that turns this into a structured error.
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight wire budget validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Returned by validateWireBudget. `breakdown` reports the per-component
+ * token estimates so callers (smoke endpoint, error messages) can show the
+ * user where the budget went.
+ */
+export interface WireBudgetBreakdown {
+  systemPrompt: number;
+  messages: number;
+  overlay: number;
+}
+
+export interface WireBudgetResult {
+  ok: boolean;
+  estimatedTokens: number;
+  breakdown: WireBudgetBreakdown;
+}
+
+/**
+ * Re-estimate the full wire cost (system prompt + messages + overlay-hydrated
+ * tool result bodies) immediately before chat() is called. Called AFTER
+ * compressOldMessages so the breakdown reflects the post-compression state.
+ *
+ * `outgoing` is the array as it would be sent to chat(). We measure the
+ * system message separately (so callers can attribute the system prompt
+ * vs. messages portion of the spend) and add overlay bytes for every tool
+ * message whose tool_call_id is currently in the overlay — that's what
+ * runQwenTurn substitutes in for the real wire send.
+ *
+ * Returns ok=false when the total exceeds WIRE_HARD_CAP. Pure function;
+ * no side effects.
+ */
+export function validateWireBudget(
+  systemPrompt: string,
+  outgoing: ChatMessage[],
+  overlay: Map<string, string>,
+): WireBudgetResult {
+  const systemPromptTokens = estimateTokens(systemPrompt);
+
+  // Tokens for non-system messages, JSON-stringified the way they will be
+  // serialised over the wire. Skip the system message we already counted.
+  let messagesText = "";
+  for (const m of outgoing) {
+    const role = (m as { role?: string })?.role;
+    if (role === "system") continue;
+    messagesText += JSON.stringify(m);
+  }
+  const messagesTokens = estimateTokens(messagesText);
+
+  // Overlay-hydrated bodies. We count an overlay entry as soon as it has a
+  // matching tool_call_id in `outgoing` — runQwenTurn will substitute that
+  // entry's content for the stub at send time, so the wire form pays the
+  // full bytes.
+  const liveIds = new Set<string>();
+  for (const m of outgoing) {
+    const msg = m as { role?: string; tool_call_id?: string };
+    if (msg?.role === "tool" && typeof msg.tool_call_id === "string") {
+      liveIds.add(msg.tool_call_id);
+    }
+  }
+  let overlayText = "";
+  for (const [id, content] of overlay.entries()) {
+    if (liveIds.has(id)) overlayText += content;
+  }
+  const overlayTokens = estimateTokens(overlayText);
+
+  const total = systemPromptTokens + messagesTokens + overlayTokens;
+  return {
+    ok: total <= WIRE_HARD_CAP,
+    estimatedTokens: total,
+    breakdown: {
+      systemPrompt: systemPromptTokens,
+      messages: messagesTokens,
+      overlay: overlayTokens,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,14 +1250,44 @@ export async function runQwenTurn(
         }
 
         // Gather context: persona + shared facts + vector recall + Layer C state.
+        // Budget allocation comes from ADR-0003 sub-budgets:
+        //   topical decisions   → mpSearch(qwen wing) → memories block
+        //   topical prose       → mpSearch(shared wing) → facts block
+        //   channel state       → loadChannelState (truncated below)
+        // Each is converted from token budget to char cap via tokensToChars.
         const persona = await ensurePersona();
-        const memories = mpEnabled()
-          ? (await mpSearch(userMessage, { wing: "qwen", limit: 3 })).map((r) => r.text)
-          : await recall(channelId, userMessage, 3, 1500);
+        const memoriesCharCap = tokensToChars(TOPICAL_DECISIONS_BUDGET);
+        const memoriesRaw = mpEnabled()
+          ? (
+              await mpSearch(userMessage, { wing: "qwen", limit: 3 })
+            ).map((r) => r.text)
+          : await recall(channelId, userMessage, 3, memoriesCharCap);
+        // Cap the joined memories block to TOPICAL_DECISIONS_BUDGET-equivalent
+        // chars. We keep entries newest-first (caller's order) and stop once
+        // adding one more would overflow.
+        const memories: string[] = [];
+        let memTotal = 0;
+        for (const m of memoriesRaw) {
+          const cost = m.length + 4; // approx "- " prefix + newline
+          if (memTotal + cost > memoriesCharCap) break;
+          memories.push(m);
+          memTotal += cost;
+        }
         const facts = mpEnabled()
-          ? await mpSearchAsString("", { wing: "shared", limit: 10, maxChars: 1500 })
-          : await readFactsAsString(1500);
-        const channelState = await loadChannelState(session);
+          ? await mpSearchAsString("", {
+              wing: "shared",
+              limit: 10,
+              maxChars: tokensToChars(TOPICAL_PROSE_BUDGET),
+            })
+          : await readFactsAsString(tokensToChars(TOPICAL_PROSE_BUDGET));
+        let channelState = await loadChannelState(session);
+        // Apply CHANNEL_STATE_BUDGET cap. Truncation is fine here — the
+        // markdown is auto-built each turn and the head contains the most
+        // recent task; tail is older decisions/refs.
+        const channelStateCharCap = tokensToChars(CHANNEL_STATE_BUDGET);
+        if (channelState.length > channelStateCharCap) {
+          channelState = channelState.slice(0, channelStateCharCap);
+        }
         const systemPrompt = buildSystemPrompt({
           persona,
           memories,
@@ -1088,11 +1298,10 @@ export async function runQwenTurn(
 
         await compressOldMessages(session, systemPrompt, toolResultOverlay);
 
-        // Build outgoing message list. For any tool message whose tool_call_id
-        // has a full-content entry in the overlay, substitute the full payload
-        // so Qwen reasons over the complete result on the immediately-following
-        // chat() call. The session.messages copy stays truncated for history.
-        const outgoing: ChatMessage[] = [
+        // Helper: build the wire-shaped outgoing array (system + hydrated
+        // messages). Used twice if pre-flight forces a second compression
+        // pass.
+        const buildOutgoing = (): ChatMessage[] => [
           { role: "system", content: systemPrompt },
           ...session.messages.map((m) => {
             const msg = m as { role?: string; tool_call_id?: string };
@@ -1109,6 +1318,68 @@ export async function runQwenTurn(
             return m;
           }),
         ];
+
+        // Pre-flight wire budget check (ADR-0003). Re-estimates the FULL
+        // wire cost (sys prompt + messages + overlay-hydrated bodies) and
+        // refuses to send if over WIRE_HARD_CAP. On overrun we run ONE more
+        // compression pass and re-check; if still over, surface a structured
+        // error and exit the loop without calling chat().
+        let outgoing = buildOutgoing();
+        let preflight = validateWireBudget(
+          systemPrompt,
+          outgoing,
+          toolResultOverlay,
+        );
+        if (!preflight.ok) {
+          console.warn(
+            `[qwen-harness] pre-flight over WIRE_HARD_CAP=${WIRE_HARD_CAP}: ${preflight.estimatedTokens} tokens (sys=${preflight.breakdown.systemPrompt}, msgs=${preflight.breakdown.messages}, overlay=${preflight.breakdown.overlay}). Running extra compression pass.`,
+          );
+          await compressOldMessages(session, systemPrompt, toolResultOverlay);
+          outgoing = buildOutgoing();
+          preflight = validateWireBudget(
+            systemPrompt,
+            outgoing,
+            toolResultOverlay,
+          );
+          if (!preflight.ok) {
+            const msg = `Wire budget exceeded after extra compression: ${preflight.estimatedTokens} tokens > WIRE_HARD_CAP=${WIRE_HARD_CAP}. Breakdown: systemPrompt=${preflight.breakdown.systemPrompt}, messages=${preflight.breakdown.messages}, overlay=${preflight.breakdown.overlay}.`;
+            console.error(`[qwen-harness] ${msg}`);
+            result = {
+              finalText: `Qwen refused to send an over-budget request to vLLM. ${msg}`,
+              stopReason: "error",
+              turns: session.currentTurn,
+              sessionId: session.id,
+              wireBudget: {
+                systemPromptTokens: preflight.breakdown.systemPrompt,
+                messagesTokens: preflight.breakdown.messages,
+                overlayTokens: preflight.breakdown.overlay,
+                totalWireTokens: preflight.estimatedTokens,
+                headroomToHardCap: WIRE_HARD_CAP - preflight.estimatedTokens,
+                headroomToSystemBudget:
+                  SYSTEM_BUDGET - preflight.breakdown.systemPrompt,
+              },
+              error: {
+                kind: "wire_budget_exceeded",
+                message: msg,
+                estimatedTokens: preflight.estimatedTokens,
+                breakdown: preflight.breakdown,
+              },
+            };
+            session.taskState = "awaiting_user";
+            break loop;
+          }
+        }
+        // Stash the latest successful pre-flight breakdown so the smoke
+        // endpoint can report metrics for the actual wire request.
+        result.wireBudget = {
+          systemPromptTokens: preflight.breakdown.systemPrompt,
+          messagesTokens: preflight.breakdown.messages,
+          overlayTokens: preflight.breakdown.overlay,
+          totalWireTokens: preflight.estimatedTokens,
+          headroomToHardCap: WIRE_HARD_CAP - preflight.estimatedTokens,
+          headroomToSystemBudget:
+            SYSTEM_BUDGET - preflight.breakdown.systemPrompt,
+        };
 
         let response;
         try {

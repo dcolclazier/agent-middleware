@@ -13,10 +13,12 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "smoketest:overlay": "tsx scripts/test-overlay-budget.ts",
+    "smoketest:budget-pre-flight": "tsx scripts/test-budget-pre-flight.ts",
     "smoketest:remember": "tsx scripts/test-remember.ts",
     "smoketest:sentinel": "tsx scripts/test-sentinel-parser.ts",
     "smoketest:truncation": "tsx scripts/test-truncation.ts",
     "smoketest:qwen-tools": "tsx scripts/qwen-tool-smoketest.ts",
+    "smoketest:persona-budget": "tsx scripts/test-persona-budget.ts",
     "smoketest:oversize-turn": "tsx scripts/test-oversize-turn.ts"
   },
   "dependencies": {
