@@ -42,6 +42,13 @@ import {
 } from "./mempalace-client.js";
 import { estimateTokens } from "./token-estimate.js";
 import { loadPersona, getPersonaSync, type Persona } from "./qwen-persona.js";
+import {
+  WIRE_HARD_CAP,
+  SYSTEM_BUDGET,
+  TURN_BUDGET,
+} from "./wire-budget.js";
+
+export { WIRE_HARD_CAP, SYSTEM_BUDGET, TURN_BUDGET };
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -61,26 +68,14 @@ const PER_TOOL_FAILURE_CAP = 2;
 // Wire budget — ADR-0003 hard wire cap with system-prompt sub-budgets.
 // ---------------------------------------------------------------------------
 //
-// Replaces the earlier `CONTEXT_SOFT_LIMIT_TOKENS = 25_000` soft target which
-// also explicitly preserved the last turn group "even if it alone exceeded
-// the soft limit." That contract did not actually guarantee the user's
-// requirement of "never hit vLLM's 32k window" — large user pastes or single
-// giant tool results bypassed the cap.
-//
-// New contract:
-//   - WIRE_HARD_CAP is the absolute ceiling for any outgoing chat() request,
-//     measured AFTER overlay hydration. Compression targets TURN_BUDGET for
-//     the messages array; pre-flight refuses to send if the full request
-//     (system prompt + messages + overlay) is still over WIRE_HARD_CAP.
-//   - We preserve the last turn group up to TURN_BUDGET (not unconditionally).
-//     If after one extra compression pass the request is still over, we fail
-//     at pre-flight and return a structured `error` stop reason.
-//
-// vLLM max_model_len for Qwen3-235B = 32_768; the 2k margin between
-// WIRE_HARD_CAP and the model ceiling is tokenizer-drift insurance.
-export const WIRE_HARD_CAP = 30_000;
-export const SYSTEM_BUDGET = 8_000;
-export const TURN_BUDGET = WIRE_HARD_CAP - SYSTEM_BUDGET; // 22_000
+// WIRE_HARD_CAP / SYSTEM_BUDGET / TURN_BUDGET are defined in ./wire-budget.ts
+// (imported above and re-exported for callers like the budget pre-flight
+// smoketest). Compression targets TURN_BUDGET for the messages array;
+// pre-flight refuses to send if the full request (system prompt + messages +
+// overlay) is still over WIRE_HARD_CAP. The last turn group is preserved up
+// to TURN_BUDGET (not unconditionally) — if after one extra compression pass
+// the request is still over, we fail at pre-flight with a structured `error`
+// stop reason.
 
 // SYSTEM_BUDGET sub-allocations — sum MUST equal SYSTEM_BUDGET. See
 // docs/adr/0003-hard-wire-cap-and-system-budget.md for the rationale
