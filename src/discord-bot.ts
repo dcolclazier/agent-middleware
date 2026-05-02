@@ -82,8 +82,19 @@ const claudeHandler: BotMessageHandler = async (
       // POST /api/sessions/:id/message can't leak its post-to-discord
       // back to this channel via the sessionTriggers lookup path. After
       // /end the channel must be fully dissociated.
+      //
+      // suppressDiscordPost is set as belt-and-braces against the
+      // narrow case where cancelTurn returns false (process already
+      // exited naturally between exitCode check and SIGTERM): the close
+      // handler still fires, takes the non-cancellation branch, and
+      // tries to post the just-finished turn's output. With the trigger
+      // cleared, postToDiscord would fall back to TARGET_CHANNEL_ID and
+      // post the leftover output to an unrelated default channel.
+      // Setting suppressDiscordPost short-circuits the listener.
       if (existingSessionId) {
         cancelTurn(existingSessionId);
+        const session = getSession(existingSessionId);
+        if (session) session.suppressDiscordPost = true;
         self.clearSessionForChannel(channelId);
         self.clearTrigger(existingSessionId);
       }
