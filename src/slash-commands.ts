@@ -1,0 +1,75 @@
+// --- Channel slash-command parser ---
+//
+// Recognises the `/btw | /cancel | /end` family as the FIRST non-whitespace
+// token of a Discord channel message body (after BotInstance has stripped
+// proper @-mentions and the textMentionPattern). Returns null for prose,
+// unknown verbs, or messages where the verb appears mid-sentence rather
+// than at the start.
+//
+// Why first-token only? The brief is explicit: "prose like '/end of file
+// is needed' is NOT triggered as a command." More precisely, "I want to
+// /cancel my subscription" must NOT trigger /cancel, because the verb is
+// not the first token. "/end of file is needed" DOES trigger /end (verb
+// is first; payload is "of file is needed") — `/end`'s caller is
+// responsible for ignoring the payload per the brief.
+//
+// Word-boundary check: `/cancelling now` is NOT `/cancel` — the verb must
+// be followed by whitespace, end-of-string, or punctuation, never another
+// letter that would make it a different word.
+//
+// This module is pure / no Discord, no I/O. Test coverage:
+// `scripts/test-slash-commands.ts`. CONTEXT.md → /btw, /cancel, /end.
+//
+// Slice 1 (issue #14) wires /cancel and /end. /btw is recognised here so
+// Slice 2 (issue #15) doesn't have to revisit the parser.
+
+export type SlashVerb = "/btw" | "/cancel" | "/end";
+
+export interface SlashCommand {
+  verb: SlashVerb;
+  /** Everything after the verb, leading/trailing whitespace stripped, internal whitespace collapsed to single spaces. */
+  payload: string;
+}
+
+const KNOWN_VERBS: ReadonlySet<string> = new Set(["/btw", "/cancel", "/end"]);
+
+// Match: optional leading whitespace, the verb (alphanumeric only after the
+// slash), then either end-of-string OR a non-letter character (whitespace,
+// punctuation, etc.). The `[a-z]+` character class is intentionally narrow
+// so future verbs like `/cancel-all` would need an explicit parser update
+// rather than silently matching as `/cancel` with payload `-all`.
+//
+// Capture group 1 = verb (lowercased before lookup).
+// Capture group 2 = the rest of the message AFTER the verb's trailing
+// boundary character. If the verb ended the string, group 2 is empty.
+const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?=$|[^a-z])([\s\S]*)$/i;
+
+/**
+ * Parse a channel message body for a slash-command verb.
+ *
+ * Input is expected to be the post-mention-strip, trimmed body that
+ * BotInstance.handleMessage produces before delegating to the harness
+ * handler. We tolerate leading whitespace defensively in case a future
+ * caller forgets to trim.
+ *
+ * Returns `null` for: empty input, prose without a leading slash verb,
+ * unknown slash verbs (e.g. `/foo`), or `/cancelling`-style words that
+ * have a known verb as a prefix but aren't actually that verb.
+ */
+export function parseSlashCommand(content: string): SlashCommand | null {
+  if (typeof content !== "string" || content.trim().length === 0) return null;
+
+  const m = SLASH_CMD_RE.exec(content);
+  if (!m) return null;
+
+  const verb = (m[1] ?? "").toLowerCase();
+  if (!KNOWN_VERBS.has(verb)) return null;
+
+  // Everything after the verb's word-boundary char. The boundary char itself
+  // (whitespace or punctuation) lives in group 2's leading position; trim
+  // and collapse internal whitespace so the payload is normalized.
+  const rawPayload = m[2] ?? "";
+  const payload = rawPayload.replace(/\s+/g, " ").trim();
+
+  return { verb: verb as SlashVerb, payload };
+}
