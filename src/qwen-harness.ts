@@ -1333,9 +1333,14 @@ async function searchTopicalDecisions(query: string): Promise<string[]> {
       );
     }
   }
-  const settled = await Promise.all(tasks);
+  // Promise.allSettled (not all) so a single rejecting search doesn't drop
+  // results from the other 7. mpSearch currently catches its own errors and
+  // returns []; allSettled is defence-in-depth for future changes.
+  const settled = await Promise.allSettled(tasks);
   const merged: SearchResult[] = [];
-  for (const arr of settled) merged.push(...arr);
+  for (const r of settled) {
+    if (r.status === "fulfilled") merged.push(...r.value);
+  }
   merged.sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0));
   const seen = new Set<string>();
   const out: string[] = [];
