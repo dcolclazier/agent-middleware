@@ -42,6 +42,7 @@ import {
 } from "./mempalace-client.js";
 import { estimateTokens } from "./token-estimate.js";
 import { loadPersona, getPersonaSync, type Persona } from "./qwen-persona.js";
+import { readVerbatimWindow, type TranscriptEntry } from "./channel-transcript.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -768,14 +769,38 @@ function applyRollingWindow(session: QwenSession): void {
   );
 }
 
-function buildSystemPrompt(opts: {
+/**
+ * Render a `[CHANNEL CONVERSATION]` block from a verbatim window of transcript
+ * entries (oldest-to-newest). If the rendered block exceeds
+ * VERBATIM_WINDOW_BUDGET tokens, oldest entries are dropped first until it
+ * fits. Returns the empty string when the window is empty or every entry
+ * would have been trimmed away — callers omit the block in that case.
+ */
+function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
+  if (entries.length === 0) return "";
+  const lines = entries.map(
+    (e) => `${e.timestamp} ${e.author}: ${e.text}`,
+  );
+  let i = 0;
+  while (i < lines.length) {
+    const candidate = `[CHANNEL CONVERSATION]\n${lines.slice(i).join("\n")}`;
+    if (estimateTokens(candidate) <= VERBATIM_WINDOW_BUDGET) {
+      return candidate;
+    }
+    i++;
+  }
+  return "";
+}
+
+export function buildSystemPrompt(opts: {
   persona: Persona;
   memories: string[];
   facts: string;
   channelState: string;
   tools: OpenAI.Chat.Completions.ChatCompletionFunctionTool[];
+  verbatimWindow: TranscriptEntry[];
 }): string {
-  const { persona, memories, facts, channelState, tools } = opts;
+  const { persona, memories, facts, channelState, tools, verbatimWindow } = opts;
 
   const memBlock = memories.length
     ? `[RELEVANT MEMORIES]\n${memories.map((m) => `- ${m}`).join("\n")}`
@@ -784,6 +809,7 @@ function buildSystemPrompt(opts: {
   const stateBlock = channelState.trim()
     ? `[CHANNEL STATE]\n${channelState.trim()}`
     : "";
+  const conversationBlock = renderVerbatimWindowBlock(verbatimWindow);
 
   const toolList = tools
     .map((t) => `- ${t.function.name}: ${t.function.description ?? ""}`)
@@ -792,6 +818,7 @@ function buildSystemPrompt(opts: {
   // Layer D — layered system prompt mirroring MemPalace's L0/L1/L2/L3:
   //   IDENTITY / VOICE / STATIC MEMORY  → L0 persona (always)
   //   CHANNEL STATE                     → L1 channel-scoped working memory
+  //   CHANNEL CONVERSATION              → recent verbatim cross-agent recall
   //   SHARED FACTS / RELEVANT MEMORIES  → L2 retrieval (filtered drawers)
   //   tools + instructions              → action surface
   // Channel state is placed near the top so it strongly anchors the model
@@ -804,13 +831,14 @@ function buildSystemPrompt(opts: {
 - Never fabricate tool results — only use what a tool actually returned.
 - Keep your final summary concise.
 - LARGE TOOL RESULTS: when a prior tool result in your history shows JSON with \`_kind: "tool_result_pointer"\` and a \`drawer_id\`, that means the full body was promoted to MemPalace. Use \`mempalace_get_drawer\` with that drawer_id to re-read it on demand. Do NOT re-run the original tool unless the underlying data may have changed.
-- INFINITE CONVERSATION: pre-window turn pairs are dropped from your verbatim history but live on as MemPalace drawers. If you need a fact from earlier, use \`mempalace_search\` first; \`mempalace_get_drawer\` second.`;
+- INFINITE CONVERSATION: the last ~10 messages other participants sent in this channel appear verbatim in [CHANNEL CONVERSATION]. Older turn pairs are dropped from your verbatim history but live on as MemPalace drawers — use \`mempalace_search\` first, \`mempalace_get_drawer\` second when you need something earlier than the verbatim window.`;
 
   return [
     `[IDENTITY]\n${persona.identity.trim()}`,
     `[VOICE AND VALUES]\n${persona.soul.trim()}`,
     `[STATIC MEMORY]\n${persona.memory.trim()}`,
     stateBlock,
+    conversationBlock,
     factBlock,
     memBlock,
     `[AVAILABLE TOOLS]\n${toolList}`,
@@ -1174,9 +1202,17 @@ export function validateWireBudget(
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * Window size for the [CHANNEL CONVERSATION] block (last K non-self messages).
+ * Per ADR-0003 / issue #6 — sized so 10 entries comfortably fit within
+ * VERBATIM_WINDOW_BUDGET on average; oversize entries trim oldest-first.
+ */
+const VERBATIM_WINDOW_K = 10;
+
 export async function runQwenTurn(
   channelId: string,
   userMessage: string,
+  selfAuthor?: string,
 ): Promise<RunResult> {
   return withChannelLock(channelId, async () => {
     // Idle session reset: if the persisted session hasn't been updated in
@@ -1222,6 +1258,18 @@ export async function runQwenTurn(
     // invocation — after this user message completes, the only artifact that
     // survives is the truncated stub in session.messages.
     const toolResultOverlay = new Map<string, string>();
+
+    // Verbatim window — last K non-self channel-transcript entries, fetched
+    // once per turn (issue #6). Self-author identity comes from the caller
+    // (qwen-bot.ts sources it from the live Discord client; HTTP test paths
+    // omit it, in which case readVerbatimWindow falls back to "" and any
+    // self-authored entries that may exist will pass through — acceptable
+    // for the test path because no real bot is replying there).
+    const verbatimWindow = await readVerbatimWindow(
+      channelId,
+      selfAuthor ?? "",
+      VERBATIM_WINDOW_K,
+    );
 
     let result: RunResult = {
       finalText: null,
@@ -1294,6 +1342,7 @@ export async function runQwenTurn(
           facts,
           channelState,
           tools: TOOL_SCHEMAS,
+          verbatimWindow,
         });
 
         await compressOldMessages(session, systemPrompt, toolResultOverlay);

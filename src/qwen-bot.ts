@@ -124,7 +124,11 @@ const qwenHandler: BotMessageHandler = async (
   await self.safeReact(trigger.channelId, trigger.messageId, "🧑‍💻").catch(() => {});
 
   try {
-    const result = await runQwenTurn(trigger.channelId, finalPrompt);
+    // Pass our own Discord username so readVerbatimWindow can exclude
+    // self-authored drawers (issue #6). Symmetric with captureOutgoing's
+    // sent.author.username — see channel-transcript writeTurn semantics.
+    const selfAuthor = self.getBotUsername() ?? undefined;
+    const result = await runQwenTurn(trigger.channelId, finalPrompt, selfAuthor);
     const raw =
       result.finalText && result.finalText.trim().length > 0
         ? result.finalText

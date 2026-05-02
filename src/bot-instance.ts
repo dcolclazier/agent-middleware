@@ -710,6 +710,17 @@ export class BotInstance {
     return this.botUserId;
   }
 
+  /**
+   * Discord username of the logged-in bot account (e.g. "Qwen", "ClaudeCode").
+   * Symmetric with what `captureOutgoing` writes into the channel transcript:
+   * the readVerbatimWindow exclude argument MUST match this exactly so the
+   * bot's own outgoing replies don't leak back into its [CHANNEL CONVERSATION]
+   * block. Returns null until the gateway READY event has fired.
+   */
+  getBotUsername(): string | null {
+    return this.client?.user?.username ?? null;
+  }
+
   // --- Session bookkeeping ---
 
   getChannelSessions(): Record<string, string> {
