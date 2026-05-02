@@ -802,10 +802,12 @@ function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
 
 /**
  * Render a `[RELEVANT DECISIONS]` block from durable-fact strings, trimmed
- * to TOPICAL_DECISIONS_BUDGET tokens. Drops oldest (=last in array; callers
- * pass decisions newest-first) entries first until it fits. Returns "" when
- * the input is empty or every entry would have been trimmed away — callers
- * omit the block in that case.
+ * to TOPICAL_DECISIONS_BUDGET tokens. Drops trailing entries first — the
+ * function is order-preserving, so callers control which entries get trimmed
+ * first by their sort order. Current caller (`searchTopicalDecisions`) sorts
+ * by descending similarity, so the lowest-scoring entries drop first.
+ * Returns "" when the input is empty or every entry would have been trimmed
+ * away — callers omit the block in that case.
  */
 function renderDecisionsBlock(decisions: string[]): string {
   if (decisions.length === 0) return "";
@@ -1293,16 +1295,20 @@ const VERBATIM_WINDOW_K = 10;
 const TOPICAL_DECISIONS_WINGS = ["qwen", "shared"] as const;
 
 /**
- * Rooms searched for topical durable decisions. Issue #7: matches the
- * Layer-B fact taxonomy in CONTEXT.md (decision / naming / user_preference /
- * canon_observation). MemPalace's search endpoint accepts a single `room`,
- * so we fan out one search per (wing, room) and merge by similarity.
+ * Rooms searched for topical durable decisions. Covers the Layer-B fact
+ * taxonomy in CONTEXT.md (decision / naming / user_preference /
+ * canon_observation) plus `context` — `runRemember`, `runAddFact`, and the
+ * auto-summary writer (qwen-harness.ts:maybeRemember) write `room: "context"`,
+ * so excluding it would leave that data unreachable from the system prompt.
+ * MemPalace's search endpoint accepts a single `room`, so we fan out one
+ * search per (wing, room) and merge by similarity.
  */
 const TOPICAL_DECISIONS_ROOMS = [
   "decision",
   "naming",
   "user_preference",
   "canon_observation",
+  "context",
 ] as const;
 
 /**
@@ -1456,7 +1462,7 @@ export async function runQwenTurn(
 
         const decisions = mpEnabled()
           ? await searchTopicalDecisions(topicalQuery)
-          : await recall(channelId, userMessage, 3, tokensToChars(TOPICAL_DECISIONS_BUDGET));
+          : await recall(channelId, topicalQuery, 3, tokensToChars(TOPICAL_DECISIONS_BUDGET));
 
         const prose = mpEnabled()
           ? await searchProse(topicalQuery, channelId, 10)
