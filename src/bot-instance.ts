@@ -1350,9 +1350,9 @@ export class BotInstance {
       content = priorChunks.join("\n\n") + "\n\n" + content;
       console.log(`[${this.displayName}] stitched ${priorChunks.length} prior chunks from ${message.author.username}`);
       // Re-trim after stitching: priorChunks[0] can carry leading whitespace
-      // that survives the join. Without this, the oversize-turn measurement
-      // (which trims composedBody) would diverge from what the handler
-      // actually receives, letting whitespace tokens slip past the cap.
+      // that survives the join. Keep the stitched content normalized here so
+      // size checks and the handler see the same post-stitch text, preventing
+      // leading/trailing whitespace from slipping past the cap.
       content = content.trim();
     }
 
