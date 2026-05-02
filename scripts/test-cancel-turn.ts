@@ -42,7 +42,7 @@ writeFileSync(
 // Point the runner at `node` running our hang script. CLAUDE_ARGS will be
 // appended after the script path and ignored by node.
 process.env.CLAUDE_BIN = "node";
-process.env.CLAUDE_BIN_PREFIX_ARGS = hangScript;
+process.env.CLAUDE_BIN_PREFIX_ARG = hangScript;
 process.env.CLAUDE_CWD = tmpDir;
 
 const runner = await import("../src/claude-runner.js");

@@ -60,12 +60,12 @@ documentation that matches existing pattern) over the letter
 The new doc block is the most authoritative reference for the protocol
 either way.
 
-## 3. CLAUDE_BIN / CLAUDE_BIN_PREFIX_ARGS env hooks introduced for testability
+## 3. CLAUDE_BIN / CLAUDE_BIN_PREFIX_ARG env hooks introduced for testability
 
 `scripts/test-cancel-turn.ts` needs a long-running process to SIGTERM
 without depending on the real `claude` CLI. Rather than refactor
 `createSession` to accept an injectable spawner (large blast radius), we
-exposed `CLAUDE_BIN` and `CLAUDE_BIN_PREFIX_ARGS` env vars. The test
+exposed `CLAUDE_BIN` and `CLAUDE_BIN_PREFIX_ARG` env vars. The test
 sets them to `node` + a hang-forever script.
 
 These vars are also genuinely useful in production: deployments with

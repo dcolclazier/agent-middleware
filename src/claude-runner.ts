@@ -134,13 +134,18 @@ const SESSION_TIMEOUT = 3_600_000; // 1 hour
 
 // `claude` binary path. Override with `CLAUDE_BIN` for installs where it's
 // not on PATH or for tests that want to substitute a stub. When the override
-// is itself a script runner (e.g. `node`), `CLAUDE_BIN_PREFIX_ARGS` is
+// is itself a script runner (e.g. `node`), `CLAUDE_BIN_PREFIX_ARG` is
 // inserted as the first argv element so we can wrap with e.g. a hang-forever
 // fixture in scripts/test-cancel-turn.ts without touching the runner's
 // existing argv-construction code paths.
+//
+// Only ONE prefix arg is supported (singular by name). Multi-token wrappers
+// like `node --loader tsx ./wrapper.js` should be packaged into a shell
+// script and pointed at via CLAUDE_BIN itself — splitting on whitespace
+// here would surprise wrappers whose own args contain spaces.
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
-const CLAUDE_BIN_PREFIX_ARGS = process.env.CLAUDE_BIN_PREFIX_ARGS
-  ? [process.env.CLAUDE_BIN_PREFIX_ARGS]
+const CLAUDE_BIN_PREFIX_ARGS = process.env.CLAUDE_BIN_PREFIX_ARG
+  ? [process.env.CLAUDE_BIN_PREFIX_ARG]
   : [];
 
 const CLAUDE_ARGS = [
