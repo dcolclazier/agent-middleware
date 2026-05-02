@@ -566,6 +566,49 @@ function hasStandbySentinel(content: string): boolean {
   return STANDBY_SENTINEL_RE.test(content.trim());
 }
 
+// --- Reaction protocol ---
+//
+// Discord reactions are PROTOCOL across this module, `discord-bot.ts`,
+// and `qwen-bot.ts`. Each emoji has a fixed meaning the user (and
+// downstream tooling) relies on. The agent-turn lifecycle reactions
+// (🧑‍💻/🔥/💥) are intentionally bot-agnostic — Claude and Qwen turns
+// share the visual vocabulary even though the underlying transport
+// (subprocess vs OpenAI-compatible HTTP) differs. Add new reactions
+// here when you wire them up so the table stays authoritative.
+//
+//   👀  message received and is being processed
+//        emitter: BotInstance.handleMessage (this file)
+//   ✅  acknowledged (kill-switch enable; standby-sentinel ack;
+//        post-to-discord landed for a session's final text)
+//        emitter: BotInstance.handleMessage; discord-bot.ts
+//   🛑  bot disabled by user kill-switch command
+//        emitter: BotInstance.handleMessage
+//   🤔  thinking — a Claude turn has been queued/sent or a /btw was
+//        recognised (Slice 2 will refine /btw's reaction set)
+//        emitter: discord-bot.ts (claudeHandler)
+//   🧑‍💻 agent turn started (in progress)
+//        Claude: subprocess transitioned to "running"
+//        Qwen:   harness dispatched the turn to vLLM
+//        emitters: discord-bot.ts (status listener); qwen-bot.ts
+//   🔥  agent turn completed successfully
+//        Claude: subprocess transitioned to "complete"
+//        Qwen:   harness response landed without error
+//        emitters: discord-bot.ts (status listener); qwen-bot.ts
+//   💥  agent turn ended with error
+//        Claude: subprocess transitioned to "error"
+//        Qwen:   harness threw or vLLM returned a non-OK status
+//        emitters: discord-bot.ts (status listener); qwen-bot.ts
+//   💀  /cancel confirmed — in-flight turn was torn down (CONTEXT.md → /cancel)
+//        emitter: discord-bot.ts (claudeHandler) — Claude only; Qwen does
+//        not implement /cancel today.
+//   ⚠️  /cancel no-op — nothing was in flight to cancel
+//        emitter: discord-bot.ts (claudeHandler)
+//   👋  /end confirmed — channel→session mapping cleared (CONTEXT.md → /end)
+//        emitter: discord-bot.ts (claudeHandler) — Claude only.
+//
+// Slice 2 (issue #15) will add ⏳ for "/btw queued behind another side
+// turn" once /btw's dispatch path lands.
+
 // --- Class ---
 
 export class BotInstance {
@@ -686,6 +729,19 @@ export class BotInstance {
 
   getTrigger(sessionId: string): TriggerRef | undefined {
     return this.sessionTriggers.get(sessionId);
+  }
+
+  /**
+   * Forget the trigger for a session.
+   *
+   * Called from /end so a subsequently-resumed session (e.g. via
+   * `POST /api/sessions/:id/message`) doesn't leak its post-to-discord
+   * back to the previously-associated channel via the trigger lookup
+   * path. The Session record itself is preserved (per CONTEXT.md →
+   * /end); only the channel-association sticker is removed.
+   */
+  clearTrigger(sessionId: string): void {
+    this.sessionTriggers.delete(sessionId);
   }
 
   getChannelForSession(sessionId: string): string | null {

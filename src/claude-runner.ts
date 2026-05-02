@@ -27,6 +27,16 @@ export interface Session {
    * calls return their answer only to the Promise caller.
    */
   suppressDiscordPost?: boolean;
+  /**
+   * Set true by `cancelTurn` after it successfully signals the subprocess
+   * with SIGTERM. The subprocess close handler consults this flag to
+   * short-circuit the normal "flush partial output → drain queue → emit
+   * status" sequence: a cancelled turn MUST NOT emit `post-to-discord` for
+   * whatever Claude was mid-saying, MUST NOT auto-resume, MUST NOT emit
+   * `error` status. Reset to undefined once the close handler has
+   * acknowledged it. See `cancelTurn` for the contract this enforces.
+   */
+  cancelled?: boolean;
 }
 
 interface StreamEvent {
@@ -52,7 +62,14 @@ sessionEvents.setMaxListeners(50);
 
 // --- Persistence ---
 
-const SESSIONS_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "sessions.json");
+// Persistent state file for Session metadata. Defaults to a repo-relative
+// path for local development; production deployments and tests should set
+// `CLAUDE_SESSIONS_FILE` to point at a writable location outside the repo
+// (per CLAUDE.md → "All persistent state paths come from env vars"). Tests
+// in particular MUST override this to avoid polluting the repo-local
+// sessions.json with fake fixtures.
+const SESSIONS_FILE = process.env.CLAUDE_SESSIONS_FILE
+  || join(dirname(fileURLToPath(import.meta.url)), "..", "sessions.json");
 
 interface PersistedSession {
   id: string;
@@ -121,6 +138,22 @@ export function loadSessions() {
 const CWD = process.env.CLAUDE_CWD || "/mnt/c/dev/dcc";
 const MODEL = process.env.CLAUDE_MODEL || "claude-opus-4-6";
 const SESSION_TIMEOUT = 3_600_000; // 1 hour
+
+// `claude` binary path. Override with `CLAUDE_BIN` for installs where it's
+// not on PATH or for tests that want to substitute a stub. When the override
+// is itself a script runner (e.g. `node`), `CLAUDE_BIN_PREFIX_ARG` is
+// inserted as the first argv element so we can wrap with e.g. a hang-forever
+// fixture in scripts/test-cancel-turn.ts without touching the runner's
+// existing argv-construction code paths.
+//
+// Only ONE prefix arg is supported (singular by name). Multi-token wrappers
+// like `node --loader tsx ./wrapper.js` should be packaged into a shell
+// script and pointed at via CLAUDE_BIN itself — splitting on whitespace
+// here would surprise wrappers whose own args contain spaces.
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const CLAUDE_BIN_PREFIX_ARGS = process.env.CLAUDE_BIN_PREFIX_ARG
+  ? [process.env.CLAUDE_BIN_PREFIX_ARG]
+  : [];
 
 const CLAUDE_ARGS = [
   "--output-format", "stream-json",
@@ -220,6 +253,44 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
   });
 
   proc.on("close", (code) => {
+    // Cancellation short-circuit: cancelTurn() set `cancelled` immediately
+    // before SIGTERM. We MUST drop partial output, skip the queue drain,
+    // skip notifyNemoClaw (no `post-to-discord` for the cancelled turn),
+    // skip auto-resume, and land at status === "idle" with no error. The
+    // claudeSessionId set during this turn is preserved so the next user
+    // message resumes the same Claude conversation. The buffer of stream
+    // events is intentionally NOT flushed: a SIGTERMed claude CLI may emit
+    // a final assistant fragment that we'd otherwise notify on, exactly the
+    // behaviour cancelTurn exists to suppress. See test-cancel-turn.ts.
+    if (session.cancelled) {
+      session.process = null;
+      session.cancelled = undefined;
+      // Discard partial output: the contract says cancel drops what the
+      // turn produced before SIGTERM. Without this, getProgress() and
+      // listSessions() would still surface stale fragments captured
+      // from the stream before the cancel landed. `error` is cleared
+      // too — a user cancel is not a failure to report.
+      session.lastAssistantText = "";
+      session.outputBuffer = [];
+      session.resultText = null;
+      session.error = null;
+      session.status = "idle";
+      saveSessions();
+      sessionEvents.emit(`status:${session.id}`, session.status);
+      sessionEvents.emit("status", { sessionId: session.id, status: session.status });
+      // Anything still in messageQueue was enqueued AFTER cancelTurn()
+      // emptied it — i.e. the user sent a follow-up during the brief
+      // SIGTERM→close window. Without this drain, sendMessage() saw
+      // status === "running" and queued the message, then we'd silently
+      // drop it. Deliver via the normal resume path; subsequent queue
+      // entries cascade through the standard close-handler drain below.
+      if (session.messageQueue.length > 0) {
+        const nextMsg = session.messageQueue.shift()!;
+        resumeWithPrompt(session, nextMsg);
+      }
+      return;
+    }
+
     // Flush remaining buffer
     if (buffer.trim()) {
       parseStreamLines(session, buffer + "\n");
@@ -280,10 +351,10 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
 
 function resumeWithPrompt(session: Session, prompt: string) {
   const args = session.claudeSessionId
-    ? ["-p", prompt, "--resume", session.claudeSessionId, ...CLAUDE_ARGS]
-    : ["-p", prompt, ...CLAUDE_ARGS];
+    ? [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, "--resume", session.claudeSessionId, ...CLAUDE_ARGS]
+    : [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, ...CLAUDE_ARGS];
 
-  const proc = spawn("claude", args, SPAWN_OPTS);
+  const proc = spawn(CLAUDE_BIN, args, SPAWN_OPTS);
 
   session.process = proc;
   session.status = "running";
@@ -303,7 +374,7 @@ export function createSession(
 ): Session {
   const id = crypto.randomUUID();
 
-  const proc = spawn("claude", ["-p", prompt, ...CLAUDE_ARGS], SPAWN_OPTS);
+  const proc = spawn(CLAUDE_BIN, [...CLAUDE_BIN_PREFIX_ARGS, "-p", prompt, ...CLAUDE_ARGS], SPAWN_OPTS);
 
   const session: Session = {
     id,
@@ -467,6 +538,68 @@ export function killSession(id: string): boolean {
     session.process = null;
   }
   saveSessions();
+  return true;
+}
+
+/**
+ * Cancel the in-flight turn for a session WITHOUT destroying the session.
+ *
+ * This is the user-visible "Ctrl+C in the REPL" affordance — the analog of
+ * `/cancel` from a Discord channel (CONTEXT.md → /cancel). Distinct from
+ * `killSession`, which marks the session errored and is meant for
+ * destructive API consumers (`DELETE /api/sessions/:id`).
+ *
+ * Post-conditions on a running session:
+ *   - `process` is torn down (close handler will null it).
+ *   - `messageQueue` is drained (anything queued during the cancelled turn
+ *     is dropped on the floor — the user changed their mind).
+ *   - `status` ends at `idle` (NOT `error`).
+ *   - `claudeSessionId` is preserved so the next `sendMessage` resumes the
+ *     same Claude conversation via `--resume`.
+ *   - NO `post-to-discord` event is emitted for the cancelled turn — partial
+ *     output is discarded; the user expressly said "stop, don't reply."
+ *
+ * Returns:
+ *   - `true` if a running subprocess was torn down.
+ *   - `false` if the session doesn't exist or had no in-flight subprocess
+ *     (no-op caller is expected to react ⚠️).
+ *
+ * The actual idle/queue/status reset happens in the subprocess `close`
+ * handler (which observes `session.cancelled` and short-circuits the normal
+ * flush+drain path). We set the flag, send SIGTERM, and let the close
+ * handler land the post-conditions — that keeps the cancellation logic
+ * co-located with the rest of the lifecycle bookkeeping rather than racing
+ * the close handler from two places.
+ */
+export function cancelTurn(id: string): boolean {
+  const session = sessions.get(id);
+  if (!session) return false;
+  if (!session.process) return false;
+  // The process exited (close handler may not have fired yet, but it
+  // will): there's nothing to signal and nothing to cancel. Don't set
+  // `cancelled`; the natural completion path will run on close.
+  if (session.process.exitCode !== null) return false;
+
+  // Try to signal. If the kernel/Node refuses (process is gone between
+  // our exitCode check and kill call, or some platform-specific failure),
+  // treat it identically to exitCode-already-set: this isn't a cancel,
+  // it's a turn that finished on its own. Returning false makes the
+  // caller emit ⚠️ ("nothing to cancel") instead of 💀.
+  let signaled = false;
+  try {
+    signaled = session.process.kill("SIGTERM");
+  } catch {
+    signaled = false;
+  }
+  if (!signaled) return false;
+
+  // Signal accepted — the close handler will fire shortly and observe
+  // `cancelled`, short-circuiting through the cancel cleanup path.
+  // Drain the pre-cancel queue eagerly here so the close handler's
+  // post-cancel-drain logic can rely on "anything still in queue must
+  // have arrived after this point."
+  session.messageQueue = [];
+  session.cancelled = true;
   return true;
 }
 

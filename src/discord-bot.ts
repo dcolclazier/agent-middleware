@@ -4,6 +4,7 @@ import {
   sendMessage,
   getSession,
   sessionEvents,
+  cancelTurn,
 } from "./claude-runner.js";
 import {
   BotInstance,
@@ -12,6 +13,7 @@ import {
   type ChannelRecentEntry,
   type ReadAttachment,
 } from "./bot-instance.js";
+import { parseSlashCommand } from "./slash-commands.js";
 
 // --- Shared state across all bots in this process ---
 // Each BotInstance adds its own user id to this set on ClientReady so no
@@ -36,6 +38,77 @@ const claudeHandler: BotMessageHandler = async (
   let content = initialContent;
 
   const existingSessionId = self.getSessionForChannel(channelId);
+
+  // --- Channel slash-commands (CONTEXT.md → /btw, /cancel, /end) ---
+  //
+  // Detected BEFORE the existing reset: / catch up regex checks. The
+  // parser is first-token-only — `/cancel` and `/end` only match as the
+  // initial token of the post-mention-strip body, so prose that contains
+  // those words mid-sentence does not trigger them. `/end <payload>` and
+  // `/cancel <payload>` ARE matched (the verb-as-first-token rule); the
+  // payload is then ignored per CONTEXT.md → /end semantics. Recognition
+  // is the same whether or not the bot was @-mentioned, because
+  // BotInstance has already stripped the mention by the time we run.
+  //
+  // Slice 1 (issue #14) wires /cancel and /end. /btw is recognised here
+  // but its dispatch is Slice 2 (issue #15) — for now we react 🤔 to ack
+  // the user and otherwise no-op.
+  const slash = parseSlashCommand(content);
+  if (slash) {
+    const safeReact = async (emoji: string) => {
+      try { await message.react(emoji); } catch {
+        // non-fatal
+      }
+    };
+
+    if (slash.verb === "/cancel") {
+      // Drive 💀/⚠️ from cancelTurn's actual return rather than a
+      // precomputed in-flight flag — the subprocess can exit between
+      // the check and the SIGTERM, which would otherwise surface as a
+      // false-positive 💀 when the brief says ⚠️.
+      const cancelled = existingSessionId ? cancelTurn(existingSessionId) : false;
+      await safeReact(cancelled ? "💀" : "⚠️");
+      return;
+    }
+    if (slash.verb === "/end") {
+      // /end ALWAYS reacts 👋 (even on an idle channel). cancelTurn is
+      // called unconditionally when there's a session — it returns false
+      // and is a no-op if nothing is in flight, which is fine. The
+      // Session record itself stays in sessions.json so it remains
+      // retrievable via the GET-by-id Sessions API; only the channel
+      // mapping is cleared.
+      //
+      // Trigger is also cleared so a subsequently-resumed session via
+      // POST /api/sessions/:id/message can't leak its post-to-discord
+      // back to this channel via the sessionTriggers lookup path. After
+      // /end the channel must be fully dissociated.
+      //
+      // suppressDiscordPost is set as belt-and-braces against the
+      // narrow case where cancelTurn returns false (process already
+      // exited naturally between exitCode check and SIGTERM): the close
+      // handler still fires, takes the non-cancellation branch, and
+      // tries to post the just-finished turn's output. With the trigger
+      // cleared, postToDiscord would fall back to TARGET_CHANNEL_ID and
+      // post the leftover output to an unrelated default channel.
+      // Setting suppressDiscordPost short-circuits the listener.
+      if (existingSessionId) {
+        cancelTurn(existingSessionId);
+        const session = getSession(existingSessionId);
+        if (session) session.suppressDiscordPost = true;
+        self.clearSessionForChannel(channelId);
+        self.clearTrigger(existingSessionId);
+      }
+      await safeReact("👋");
+      return;
+    }
+    // /btw — Slice 2 (issue #15) wires the side-session dispatch. For now
+    // we ack with 🤔 ("noticed your message") and otherwise no-op so we
+    // don't accidentally treat the /btw payload as a main-turn prompt.
+    // This matches the brief's "no-op or 'not yet' reaction is
+    // acceptable" allowance.
+    await safeReact("🤔");
+    return;
+  }
 
   // Directive detection runs on the UN-prepended content so an attachment
   // prefix can't accidentally defeat "reset:" / "catch up ..." semantics.
