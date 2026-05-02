@@ -6,11 +6,11 @@
 // unknown verbs, or messages where the verb appears mid-sentence rather
 // than at the start.
 //
-// Why first-token only? The brief is explicit: "prose like '/end of file
-// is needed' is NOT triggered as a command." More precisely, "I want to
-// /cancel my subscription" must NOT trigger /cancel, because the verb is
-// not the first token. "/end of file is needed" DOES trigger /end (verb
-// is first; payload is "of file is needed") — `/end`'s caller is
+// Why first-token only? A slash verb is only recognized when it is the
+// first non-whitespace token. So "I want to /cancel my subscription"
+// must NOT trigger /cancel, because the verb is not the first token.
+// By contrast, "/end of file is needed" DOES trigger /end (verb is
+// first; payload is "of file is needed") — `/end`'s caller is
 // responsible for ignoring the payload per the brief.
 //
 // Word-boundary check: `/cancelling now` is NOT `/cancel` — the verb must
