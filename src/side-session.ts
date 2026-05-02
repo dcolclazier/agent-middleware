@@ -15,10 +15,12 @@
 //    spawns with bare `-p prompt …` arguments.
 //
 //  - Side session is NOT persisted to `sessions.json`. The runner's
-//    `saveSessions` skips sessions with `ephemeral: true`. (We accept that
-//    they remain in the in-memory `sessions` map for the process lifetime —
-//    bounded by `/btw` traffic, GC'd on restart. A future slice can add a
-//    sweep if memory pressure ever shows up.)
+//    `saveSessions` skips sessions with `ephemeral: true`. The Session
+//    record stays in the runner's in-memory `sessions` map for the rest of
+//    the process lifetime (bounded by `/btw` traffic; cleared at the next
+//    restart). A future slice can add an explicit map sweep on terminal
+//    if `/btw` traffic grows enough that the retained outputBuffer arrays
+//    show up in heap profiles.
 //
 //  - Side session NEVER overwrites the channel→Session mapping. This
 //    module does not touch `BotInstance.setSessionForChannel`; only the
@@ -138,6 +140,24 @@ export interface EnqueueSideTurnInput {
 }
 
 /**
+ * Maximum pending /btw entries per channel. Above this we soft-reject the
+ * /btw — the discord-bot path will see the rejection and react 💥, telling
+ * the user to wait. Defends against a misbehaving client spamming /btw
+ * indefinitely (each queue entry retains closures over the discord-bot's
+ * `self`, the message, and the trigger — unbounded growth is a memory
+ * pressure vector). 10 is generous: at the 5 msg/sec Discord rate limit
+ * a user has to spam for 2+ seconds before hitting the cap.
+ */
+const MAX_QUEUE_PER_CHANNEL = 10;
+
+/** Sentinel value used in `inFlightByChannel` to reserve a slot synchronously
+ * before the spawned session id is known (we can't put a real session id
+ * there yet because spawn happens after an async history fetch). The
+ * lifetime of this sentinel is at most one event-loop tick — `spawnAndTrack`
+ * overwrites it with the real session id immediately after `createSession`. */
+const SLOT_RESERVED_SENTINEL = "<reserved>";
+
+/**
  * Accept a /btw call for a channel.
  *
  * If no side session is in flight for the channel, spawns immediately and
@@ -148,13 +168,30 @@ export interface EnqueueSideTurnInput {
  * This is the Discord-bot dispatch entry point — it owns all the side-turn
  * lifecycle bookkeeping (in-flight marker, queue, post-to-discord listener
  * for drain). The caller does not see any of that machinery.
+ *
+ * The returned Promise resolves with the spawned session id at SPAWN time
+ * (not at completion) — that's the moment the discord-bot needs to bind a
+ * trigger to the session for the existing reaction listeners.
  */
 export function enqueueSideTurn(input: EnqueueSideTurnInput): Promise<string> {
   return new Promise<string>((resolve, reject) => {
+    // Synchronous slot reservation: we MUST set inFlightByChannel before
+    // anything async runs, because spawnAndTrack awaits the channel-history
+    // provider before it gets a session id to put here. Without this
+    // reservation, two concurrent /btw calls in the same microtask tick
+    // would both pass the "is anything in flight?" check, both spawn, and
+    // we'd violate the at-most-one-side-session-per-channel AC.
     const inFlight = inFlightByChannel.get(input.channelId);
     if (inFlight !== undefined) {
-      // Slot occupied — queue.
       const q = queueByChannel.get(input.channelId) ?? [];
+      if (q.length >= MAX_QUEUE_PER_CHANNEL) {
+        // Soft-reject — the caller (discord-bot) reacts 💥 and the user
+        // sees the failure. Better than letting the queue grow unbounded.
+        reject(new Error(
+          `side-session queue for channel ${input.channelId} is full (${q.length} >= ${MAX_QUEUE_PER_CHANNEL}); /btw refused`,
+        ));
+        return;
+      }
       q.push({
         channelId: input.channelId,
         payload: input.payload,
@@ -168,7 +205,8 @@ export function enqueueSideTurn(input: EnqueueSideTurnInput): Promise<string> {
       return;
     }
 
-    // Slot free — spawn now.
+    // Slot free — reserve it synchronously, then spawn.
+    inFlightByChannel.set(input.channelId, SLOT_RESERVED_SENTINEL);
     input.onAck?.();
     spawnAndTrack(input.channelId, {
       channelId: input.channelId,
@@ -177,7 +215,7 @@ export function enqueueSideTurn(input: EnqueueSideTurnInput): Promise<string> {
       mainSessionLookup: input.mainSessionLookup,
       resolve,
       reject,
-    }).catch(reject);
+    });
   });
 }
 
@@ -205,11 +243,23 @@ async function spawnAndTrack(channelId: string, pending: PendingSideTurn): Promi
     payload: pending.payload,
   });
 
-  // Spawn ephemerally — `ephemeral: true` keeps this session out of
-  // sessions.json. The Session is held in the runner's in-memory map for
-  // the duration of the turn and is naturally garbage-collected on the
-  // next process restart.
-  const session: Session = createSession(prompt, false, false, null, { ephemeral: true });
+  let session: Session;
+  try {
+    // Spawn ephemerally — `ephemeral: true` keeps this session out of
+    // sessions.json. The Session is held in the runner's in-memory map for
+    // the duration of the turn; ephemeral entries accumulate over the
+    // process lifetime (bounded by /btw traffic, cleared on restart).
+    session = createSession(prompt, false, false, null, { ephemeral: true });
+  } catch (err) {
+    // Spawn failed — we MUST free the reserved slot AND drain the next
+    // queued /btw, otherwise everything queued behind us is stuck.
+    inFlightByChannel.delete(channelId);
+    pending.reject(err);
+    drainNext(channelId);
+    return;
+  }
+
+  // Replace the slot reservation with the real session id.
   inFlightByChannel.set(channelId, session.id);
   pending.resolve(session.id);
 
@@ -235,9 +285,12 @@ function drainNext(channelId: string): void {
   }
   const next = q.shift()!;
   if (q.length === 0) queueByChannel.delete(channelId);
+  // Re-reserve the slot synchronously for the drained turn — same race
+  // protection as the initial enqueueSideTurn path.
+  inFlightByChannel.set(channelId, SLOT_RESERVED_SENTINEL);
   // Spawn the next pending turn. spawnAndTrack handles in-flight bookkeeping
-  // + recursive drain on terminal.
-  spawnAndTrack(channelId, next).catch(next.reject);
+  // + recursive drain on terminal (and on spawn failure).
+  void spawnAndTrack(channelId, next);
 }
 
 // --- Test hook ---
