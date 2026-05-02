@@ -132,7 +132,7 @@ cleared. The next message in the channel falls through to the
 
 ### Side session
 The ephemeral, single-turn `Session` spawned by `/btw`. Created with a fresh
-Claude session id (no `--resume` of the channel's main session — see ADR-0002),
+Claude session id (no `--resume` of the channel's main session — see ADR-0005),
 with a prompt seeded from `fetchChannelContext(...)` plus the main session's
 `lastAssistantText` for read-only awareness of the in-flight context. Single
 turn: discarded after `complete`, not persisted to `sessions.json`. Posts to
