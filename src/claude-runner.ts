@@ -254,6 +254,15 @@ function attachProcessHandlers(session: Session, proc: ChildProcess) {
       session.process = null;
       session.cancelled = undefined;
       session.messageQueue = [];
+      // Discard partial output: the contract says cancel drops what the
+      // turn produced before SIGTERM. Without this, getProgress() and
+      // listSessions() would still surface stale fragments captured
+      // from the stream before the cancel landed. `error` is cleared
+      // too — a user cancel is not a failure to report.
+      session.lastAssistantText = "";
+      session.outputBuffer = [];
+      session.resultText = null;
+      session.error = null;
       session.status = "idle";
       saveSessions();
       sessionEvents.emit(`status:${session.id}`, session.status);
