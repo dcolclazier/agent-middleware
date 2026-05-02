@@ -381,6 +381,39 @@ function hasStandbySentinel(content: string): boolean {
   return STANDBY_SENTINEL_RE.test(content.trim());
 }
 
+// --- Reaction protocol ---
+//
+// Discord reactions are PROTOCOL across this module and `discord-bot.ts`.
+// Each emoji has a fixed meaning the user (and downstream tooling) relies
+// on. Add new reactions here when you wire them up so the table stays
+// authoritative.
+//
+//   👀  message received and is being processed
+//        emitter: BotInstance.handleMessage (this file)
+//   ✅  acknowledged (kill-switch enable; standby-sentinel ack;
+//        post-to-discord landed for a session's final text)
+//        emitter: BotInstance.handleMessage; discord-bot.ts
+//   🛑  bot disabled by user kill-switch command
+//        emitter: BotInstance.handleMessage
+//   🤔  thinking — a Claude turn has been queued/sent or a /btw was
+//        recognised (Slice 2 will refine /btw's reaction set)
+//        emitter: discord-bot.ts (claudeHandler)
+//   🧑‍💻 Claude subprocess transitioned to "running"
+//        emitter: discord-bot.ts (status listener)
+//   🔥  Claude subprocess transitioned to "complete"
+//        emitter: discord-bot.ts (status listener)
+//   💥  Claude subprocess transitioned to "error"
+//        emitter: discord-bot.ts (status listener)
+//   💀  /cancel confirmed — in-flight turn was torn down (CONTEXT.md → /cancel)
+//        emitter: discord-bot.ts (claudeHandler)
+//   ⚠️  /cancel no-op — nothing was in flight to cancel
+//        emitter: discord-bot.ts (claudeHandler)
+//   👋  /end confirmed — channel→session mapping cleared (CONTEXT.md → /end)
+//        emitter: discord-bot.ts (claudeHandler)
+//
+// Slice 2 (issue #15) will add ⏳ for "/btw queued behind another side
+// turn" once /btw's dispatch path lands.
+
 // --- Class ---
 
 export class BotInstance {

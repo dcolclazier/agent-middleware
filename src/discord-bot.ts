@@ -4,6 +4,7 @@ import {
   sendMessage,
   getSession,
   sessionEvents,
+  cancelTurn,
 } from "./claude-runner.js";
 import {
   BotInstance,
@@ -12,6 +13,7 @@ import {
   type ChannelRecentEntry,
   type ReadAttachment,
 } from "./bot-instance.js";
+import { parseSlashCommand } from "./slash-commands.js";
 
 // --- Shared state across all bots in this process ---
 // Each BotInstance adds its own user id to this set on ClientReady so no
@@ -36,6 +38,66 @@ const claudeHandler: BotMessageHandler = async (
   let content = initialContent;
 
   const existingSessionId = self.getSessionForChannel(channelId);
+
+  // --- Channel slash-commands (CONTEXT.md → /btw, /cancel, /end) ---
+  //
+  // Detected BEFORE the existing reset: / catch up regex checks so prose
+  // like "/end of file is needed" never reaches the slash-command branch
+  // by accident — the parser is first-token-only and word-boundary-aware
+  // (see scripts/test-slash-commands.ts). Recognition is the same whether
+  // or not the bot was @-mentioned, because BotInstance has already
+  // stripped the mention by the time we run.
+  //
+  // Slice 1 (issue #14) wires /cancel and /end. /btw is recognised here
+  // but its dispatch is Slice 2 (issue #15) — for now we react 🤔 to ack
+  // the user and otherwise no-op.
+  const slash = parseSlashCommand(content);
+  if (slash) {
+    const inFlightSession = existingSessionId ? getSession(existingSessionId) : undefined;
+    const turnInFlight =
+      existingSessionId !== undefined &&
+      inFlightSession !== undefined &&
+      inFlightSession.process !== null;
+
+    const safeReact = async (emoji: string) => {
+      try { await message.react(emoji); } catch {
+        // non-fatal
+      }
+    };
+
+    if (slash.verb === "/cancel") {
+      if (turnInFlight) {
+        cancelTurn(existingSessionId!);
+        await safeReact("💀");
+      } else {
+        await safeReact("⚠️");
+      }
+      return;
+    }
+    if (slash.verb === "/end") {
+      // /end ALWAYS clears the channel mapping. If a turn is in flight,
+      // run the cancel first so the subprocess is torn down (single
+      // user-visible step). Payload after /end is intentionally ignored
+      // per CONTEXT.md → /end. The Session record itself stays in
+      // sessions.json so it remains retrievable via the GET-by-id Sessions
+      // API — only the channel mapping is cleared.
+      if (turnInFlight) {
+        cancelTurn(existingSessionId!);
+      }
+      if (existingSessionId) {
+        self.clearSessionForChannel(channelId);
+      }
+      await safeReact("👋");
+      return;
+    }
+    // /btw — Slice 2 (issue #15) wires the side-session dispatch. For now
+    // we ack with 🤔 ("noticed your message") and otherwise no-op so we
+    // don't accidentally treat the /btw payload as a main-turn prompt.
+    // This matches the brief's "no-op or 'not yet' reaction is
+    // acceptable" allowance.
+    await safeReact("🤔");
+    return;
+  }
 
   // Directive detection runs on the UN-prepended content so an attachment
   // prefix can't accidentally defeat "reset:" / "catch up ..." semantics.
