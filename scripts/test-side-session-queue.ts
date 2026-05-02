@@ -537,6 +537,115 @@ try {
       );
     }
   }
+
+  // -------------------------------------------------------------------------
+  // 5. /btw on an idle channel (no main session) still spawns a side
+  //    session and posts its answer. The brief calls this out as an
+  //    explicit acceptance criterion separate from the running-main case.
+  // -------------------------------------------------------------------------
+  sect("5. /btw on an idle channel with no main session");
+  {
+    _resetSideSessionStateForTests();
+
+    const channelId = "C-no-main";
+    let acked = false;
+    const sideId = await enqueueSideTurn({
+      channelId,
+      payload: "no main session here",
+      channelHistoryProvider: async () => "",
+      // mainSessionLookup returns undefined — there is no main session.
+      mainSessionLookup: () => undefined,
+      onAck: () => { acked = true; },
+    });
+    check("acked immediately (no main means no queueing constraint)", acked === true);
+
+    await waitFor(
+      () => {
+        const s = getSession(sideId);
+        return s !== undefined && s.process === null && s.status !== "running";
+      },
+      3000,
+      "no-main side session terminal",
+    );
+
+    const after = getSession(sideId);
+    check(
+      "side session reached terminal status",
+      after !== undefined && (after.status === "complete" || after.status === "idle"),
+      `status=${after?.status}`,
+    );
+    check(
+      "side session captured a stub session id (proves the spawn happened)",
+      typeof after?.claudeSessionId === "string" && after?.claudeSessionId !== null,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 6. Per-channel queue cap: an 11th /btw beyond the slot+10 queued is
+  //    soft-rejected so a hostile client cannot grow the queue without
+  //    bound. This is a defence-in-depth correctness fix surfaced during
+  //    self-review (see REVIEW-NOTES.md).
+  // -------------------------------------------------------------------------
+  sect("6. per-channel queue cap");
+  {
+    _resetSideSessionStateForTests();
+    process.env.STUB_DELAY_MS = "300"; // keep the in-flight one busy
+
+    const channelId = "C-cap";
+    // Spawn the in-flight one + 10 queued = 11 total accepted.
+    const accepted: Promise<string>[] = [];
+    for (let i = 0; i < 11; i++) {
+      accepted.push(
+        enqueueSideTurn({
+          channelId,
+          payload: `cap${i}`,
+          channelHistoryProvider: async () => "",
+          mainSessionLookup: () => undefined,
+        }),
+      );
+      // Yield microtasks so each enqueue resolves its sync acceptance
+      // before the next call sees the latest in-flight/queue state.
+      await Promise.resolve();
+    }
+
+    // The 12th should reject with the cap-full error — caller (discord-bot)
+    // would surface 💥 to the user.
+    let cap12Rejected = false;
+    let cap12ErrMsg = "";
+    try {
+      await enqueueSideTurn({
+        channelId,
+        payload: "cap-overflow",
+        channelHistoryProvider: async () => "",
+        mainSessionLookup: () => undefined,
+      });
+    } catch (err) {
+      cap12Rejected = true;
+      cap12ErrMsg = err instanceof Error ? err.message : String(err);
+    }
+    check(
+      "12th /btw rejected (cap full)",
+      cap12Rejected === true,
+      `errMsg=${cap12ErrMsg}`,
+    );
+    check(
+      "rejection message mentions the cap",
+      cap12ErrMsg.includes("queue") && cap12ErrMsg.includes("full"),
+      `errMsg=${cap12ErrMsg}`,
+    );
+
+    // Drain everything before exiting so we don't leak processes.
+    const ids = await Promise.all(accepted);
+    await waitFor(
+      () => ids.every((id) => {
+        const s = getSession(id);
+        return s !== undefined && s.process === null && s.status !== "running";
+      }),
+      15000,
+      "cap test drain",
+    );
+    process.env.STUB_DELAY_MS = "80";
+  }
 } finally {
   try { rmSync(tmpDir, { recursive: true, force: true }); } catch {
     // ignore
