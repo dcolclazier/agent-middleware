@@ -194,29 +194,46 @@ function decodeEnvelope(content: string): Envelope | null {
 }
 
 /**
- * Peek at a (possibly preview-truncated) envelope and recover ts as a
- * millisecond epoch suitable for sorting. `enforceCap` and the sort step in
- * `readVerbatimWindow` only need ts, so we tolerate truncation here rather
- * than dropping the entry. Returns 0 (sorts oldest, evicted first) for
- * undecodable / malformed / NaN-date entries.
+ * Peek at a (possibly preview-truncated) envelope and recover ts + author
+ * without requiring full JSON parse. JSON.parse is preferred (JSON-safe for
+ * escaped quotes / backslashes in author names); the regex fallback is only
+ * used when the preview is truncated mid-JSON. ts of 0 sorts oldest /
+ * evicted first; author of "" means "unrecoverable". The regex paths are
+ * best-effort under truncation — they do not handle every escape sequence.
  */
-function peekEnvelopeTs(content: string): number {
-  if (typeof content !== "string" || content.length === 0) return 0;
+function peekEnvelope(content: string): { ts: number; author: string } {
+  if (typeof content !== "string" || content.length === 0) {
+    return { ts: 0, author: "" };
+  }
   try {
     const parsed = JSON.parse(content);
-    if (parsed && typeof parsed.ts === "string") {
-      const t = new Date(parsed.ts).getTime();
-      return Number.isFinite(t) ? t : 0;
+    if (parsed && typeof parsed === "object") {
+      let ts = 0;
+      let author = "";
+      if (typeof parsed.ts === "string") {
+        const t = new Date(parsed.ts).getTime();
+        if (Number.isFinite(t)) ts = t;
+      }
+      if (typeof parsed.author === "string") author = parsed.author;
+      return { ts, author };
     }
   } catch {
-    // Truncated preview — fall through to regex fallback.
+    // Truncated preview — fall through to regex (best-effort, JSON-unsafe).
   }
-  const m = content.match(/"ts"\s*:\s*"([^"]+)"/);
-  if (m && m[1]) {
-    const t = new Date(m[1]).getTime();
-    return Number.isFinite(t) ? t : 0;
+  let ts = 0;
+  let author = "";
+  const tsMatch = content.match(/"ts"\s*:\s*"([^"]+)"/);
+  if (tsMatch && tsMatch[1]) {
+    const t = new Date(tsMatch[1]).getTime();
+    if (Number.isFinite(t)) ts = t;
   }
-  return 0;
+  const authorMatch = content.match(/"author"\s*:\s*"([^"]+)"/);
+  if (authorMatch && authorMatch[1]) author = authorMatch[1];
+  return { ts, author };
+}
+
+function peekEnvelopeTs(content: string): number {
+  return peekEnvelope(content).ts;
 }
 
 function entryFromDrawer(d: DrawerEntry): TranscriptEntry | null {
@@ -261,13 +278,19 @@ function withChannelLock<T>(
   const result = prev.then(() => fn());
   // Swallow rejection on the lock chain so one failed write doesn't poison
   // every subsequent write for that channel.
-  channelLocks.set(
-    channelId,
-    result.then(
-      () => {},
-      () => {},
-    ),
+  const settled = result.then(
+    () => {},
+    () => {},
   );
+  channelLocks.set(channelId, settled);
+  // When this chain settles, drop the entry only if no later writer chained
+  // on top of us. Bounds the map to the active write set (rather than the
+  // lifetime channel set) for processes that see many ephemeral channelIds.
+  void settled.finally(() => {
+    if (channelLocks.get(channelId) === settled) {
+      channelLocks.delete(channelId);
+    }
+  });
   return result;
 }
 
@@ -342,12 +365,13 @@ export async function readVerbatimWindow(
     // List returns content_preview, so envelope.text may be truncated and
     // decodeEnvelope may return null. Sort by ts (peeked from the truncated
     // preview) before slicing, then re-fetch full content for the K we
-    // actually return.
+    // actually return. peekEnvelope tries JSON.parse first (JSON-safe for
+    // escaped quotes / backslashes in usernames) and falls back to a regex
+    // only on parse failure.
     const annotatedAuthors = drawers
       .map((d) => {
-        const m = d.text.match(/"author"\s*:\s*"([^"]+)"/);
-        const author = m && m[1] ? m[1] : "";
-        return { d, ts: peekEnvelopeTs(d.text), author };
+        const env = peekEnvelope(d.text);
+        return { d, ts: env.ts, author: env.author };
       })
       .filter((a) => a.author !== "" && a.author !== excludeAuthor);
     annotatedAuthors.sort((a, b) => a.ts - b.ts);
@@ -443,12 +467,16 @@ export function _resetSeenIncomingForTesting(): void {
 }
 
 /**
- * Capture an incoming Discord message into the transcript wing. Idempotent
- * on `messageId` — repeated calls (e.g. from multiple BotInstances handling
- * the same MessageCreate event) are no-ops after the first.
+ * Capture a Discord message into the transcript wing. Idempotent on
+ * `messageId`: repeated calls (e.g. from sibling BotInstances handling the
+ * same MessageCreate event, OR from the bot's own send-side capture
+ * arriving before/after siblings see the event) are no-ops after the first.
  *
- * Oversize-message filtering happens upstream (slice #5) before this is
- * called.
+ * Use the same call shape for both directions — the bot's own send must
+ * pass the sent `Message.id` and `Message.author.username` so its drawer is
+ * deduped against the sibling-bot incoming view of the same Discord
+ * message. Oversize-message filtering happens upstream (slice #5) before
+ * this is called.
  */
 export async function transcribeIncoming(
   channelId: string,
@@ -458,22 +486,6 @@ export async function transcribeIncoming(
   timestamp: string,
 ): Promise<void> {
   if (!markSeen(messageId)) return;
-  await writeTurn(channelId, author, text, timestamp);
-}
-
-/**
- * Capture an outgoing bot reply (the bot's own utterance) into the transcript
- * wing. No dedupe here: the bot layer calls this exactly once per send. The
- * `author` is the bot's display name or user id — chosen to mirror the
- * incoming author convention so readVerbatimWindow's exclude-by-author
- * filter works symmetrically.
- */
-export async function transcribeOutgoing(
-  channelId: string,
-  author: string,
-  text: string,
-  timestamp: string,
-): Promise<void> {
   await writeTurn(channelId, author, text, timestamp);
 }
 
@@ -488,35 +500,66 @@ export async function transcribeOutgoing(
  * NEVER touched here: the list query is scoped to wing="conversation",
  * room=channelId, so fact drawers are out of scope by construction.
  */
+/**
+ * Bound on the convergence loop in `enforceCap`. A pathological channel
+ * (e.g. >>CAP*2 backlog from prior delete failures or multi-process writes)
+ * is paged through across this many iterations. Beyond that, we log and
+ * return — the next writeTurn will resume convergence.
+ */
+const ENFORCE_CAP_MAX_ITERATIONS = 5;
+
 async function enforceCap(channelId: string): Promise<void> {
-  // List with generous slack so any real-world backlog (existing data,
-  // delete failures from prior runs, multi-process writes pre-mutex) is
-  // catchable in one pass — the previous CAP+1 limit could only delete one
-  // drawer per write, never converging if the channel was further over.
-  const drawers = await backend.listDrawers({
-    wing: CHANNEL_TRANSCRIPT_WING,
-    room: channelId,
-    limit: CHANNEL_TRANSCRIPT_CAP * 2 + 1,
-  });
-  if (drawers.length <= CHANNEL_TRANSCRIPT_CAP) return;
+  const LIST_LIMIT = CHANNEL_TRANSCRIPT_CAP * 2 + 1;
+  for (let iter = 0; iter < ENFORCE_CAP_MAX_ITERATIONS; iter++) {
+    const drawers = await backend.listDrawers({
+      wing: CHANNEL_TRANSCRIPT_WING,
+      room: channelId,
+      limit: LIST_LIMIT,
+    });
+    if (drawers.length <= CHANNEL_TRANSCRIPT_CAP) return;
 
-  // Order oldest-first by ts peeked from the (possibly preview-truncated)
-  // envelope. peekEnvelopeTs returns 0 for undecodable / NaN-date / missing
-  // ts entries — those sort first so they're the first evicted.
-  const annotated = drawers.map((d) => ({ d, ts: peekEnvelopeTs(d.text) }));
-  annotated.sort((a, b) => a.ts - b.ts);
+    // Order oldest-first by ts peeked from the (possibly preview-truncated)
+    // envelope. peekEnvelopeTs returns 0 for undecodable / NaN-date /
+    // missing ts entries — those sort first so they're the first evicted.
+    const annotated = drawers.map((d) => ({ d, ts: peekEnvelopeTs(d.text) }));
+    annotated.sort((a, b) => a.ts - b.ts);
 
-  const overflow = annotated.length - CHANNEL_TRANSCRIPT_CAP;
-  for (let i = 0; i < overflow; i++) {
-    const id = annotated[i]?.d.id;
-    if (!id) continue;
-    try {
-      await backend.deleteDrawer(id);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[channel-transcript] evict failed for drawer ${id}: ${msg}`,
+    const overflow = annotated.length - CHANNEL_TRANSCRIPT_CAP;
+    let evictedThisIter = 0;
+    for (let i = 0; i < overflow; i++) {
+      const id = annotated[i]?.d.id;
+      if (!id) continue;
+      try {
+        const ok = await backend.deleteDrawer(id);
+        if (ok) {
+          evictedThisIter++;
+        } else {
+          // Default backend (mempalace-client.ts:208) returns false on soft
+          // failure (HTTP error) without throwing — surface those.
+          console.error(
+            `[channel-transcript] deleteDrawer returned false for drawer ${id} (room=${channelId})`,
+          );
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[channel-transcript] evict failed for drawer ${id}: ${msg}`,
+        );
+      }
+    }
+    // Two early-exit conditions: (1) we got the full set in one list (so
+    // we know nothing remains beyond what we just processed), or (2) no
+    // delete actually succeeded this iter (further iterations would loop
+    // on the same un-deletable drawers).
+    if (drawers.length < LIST_LIMIT) return;
+    if (evictedThisIter === 0) {
+      console.warn(
+        `[channel-transcript] enforceCap made no progress for room=${channelId}; channel may remain over cap`,
       );
+      return;
     }
   }
+  console.warn(
+    `[channel-transcript] enforceCap hit max iterations (${ENFORCE_CAP_MAX_ITERATIONS}) for room=${channelId}; next writeTurn will resume convergence`,
+  );
 }

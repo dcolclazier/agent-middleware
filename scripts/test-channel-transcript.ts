@@ -18,7 +18,6 @@ import {
   readVerbatimWindow,
   searchProse,
   transcribeIncoming,
-  transcribeOutgoing,
   CHANNEL_TRANSCRIPT_CAP,
   CHANNEL_TRANSCRIPT_WING,
   _setBackendForTesting,
@@ -471,30 +470,38 @@ async function main() {
     _resetSeenIncomingForTesting();
   }
 
-  // 10. transcribeOutgoing writes one drawer per call (no dedupe; bot layer
-  // controls when to send and is the sole caller per outbound message).
-  sect("10. transcribeOutgoing — one drawer per call");
+  // 10. Outgoing-via-incoming dedupe: when the bot's own send and a sibling
+  // BotInstance both transcribe the same Discord message id, only one
+  // drawer is written. This is the architectural fix for duplicate
+  // outbound captures (formerly transcribeOutgoing wrote unconditionally).
+  sect("10. transcribeIncoming — outbound + sibling dedupe on shared id");
   {
     const backend = makeBackend();
     _setBackendForTesting(backend);
-    await transcribeOutgoing(
+    _resetSeenIncomingForTesting();
+    // Bot A's own captureOutgoing fires first.
+    await transcribeIncoming(
       channel,
+      "shared-msg-id",
       "ClaudeCode",
       "Done.",
       "2026-06-02T00:00:00Z",
     );
-    await transcribeOutgoing(
+    // Sibling Bot B's handleMessage observes the same MessageCreate.
+    await transcribeIncoming(
       channel,
+      "shared-msg-id",
       "ClaudeCode",
-      "Standing by.",
-      "2026-06-02T00:00:30Z",
+      "Done.",
+      "2026-06-02T00:00:00Z",
     );
-    check("two drawers written", backend.drawers.length === 2);
     check(
-      "both drawers carry the bot author",
-      backend.drawers.every((d) => d.content.includes("ClaudeCode")),
+      "exactly 1 drawer from 2 calls on the same Discord message id",
+      backend.drawers.length === 1,
+      `actual=${backend.drawers.length}`,
     );
     _resetBackendForTesting();
+    _resetSeenIncomingForTesting();
   }
 
   // 11. Per-channel mutex: concurrent writeTurns to one channel must not
@@ -684,6 +691,192 @@ async function main() {
       entries.some((e) => e.text === "valid ts"),
     );
     _resetBackendForTesting();
+  }
+
+  // 15. JSON-safe author extraction (Comment B): an author name containing
+  // an embedded quote (Discord allows display names with special chars
+  // through nicknames) must be recovered correctly when the preview is
+  // not truncated. Regex-only path would split on the inner quote.
+  sect("15. readVerbatimWindow — JSON-safe author with embedded quote");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    backend.drawers.push({
+      id: "quoted-author",
+      wing: CHANNEL_TRANSCRIPT_WING,
+      room: channel,
+      content: JSON.stringify({
+        v: 1,
+        ts: "2026-09-01T00:00:00.000Z",
+        author: 'name with "quote" inside',
+        text: "hello",
+      }),
+      created_at: new Date().toISOString(),
+    });
+    const window = await readVerbatimWindow(channel, "ZZ", 5);
+    check(
+      "quoted-author entry surfaces with full author preserved",
+      window.some((e) => e.author === 'name with "quote" inside'),
+      `entries=${JSON.stringify(window)}`,
+    );
+    // Author exclusion using the exact JSON-decoded string also works.
+    const excluded = await readVerbatimWindow(
+      channel,
+      'name with "quote" inside',
+      5,
+    );
+    check(
+      "exclude-by-author matches against JSON-decoded author",
+      excluded.length === 0,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 16. channelLocks cleanup (Comment C): after the queued work for a
+  // channel settles and no later writer chained on top, the lock entry is
+  // removed. Otherwise the Map would grow unbounded with channel turnover.
+  sect("16. channelLocks — entry removed after settle (no-tail case)");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    const ephemeralChannel = "5555000000";
+    await writeTurn(
+      ephemeralChannel,
+      "X",
+      "one and done",
+      "2026-09-02T00:00:00Z",
+    );
+    // settled.finally fires asynchronously — yield once so the cleanup
+    // microtask runs.
+    await new Promise((res) => setImmediate(res));
+    // The Map is module-private; we observe its size indirectly by
+    // checking that subsequent writes still work and that a second write
+    // to the same channel doesn't see a stale entry.
+    await writeTurn(
+      ephemeralChannel,
+      "X",
+      "two",
+      "2026-09-02T00:00:01Z",
+    );
+    await new Promise((res) => setImmediate(res));
+    check(
+      "two writes to one ephemeral channel both wrote drawers",
+      backend.drawers.filter(
+        (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === ephemeralChannel,
+      ).length === 2,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 17. enforceCap pages until convergence (Comment D): a backlog larger
+  // than CAP*2+1 takes more than one list iteration but converges.
+  sect("17. enforceCap — pages backlog > CAP*2+1 across iterations");
+  {
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+    // CAP = 500. Pre-populate 1500 (> CAP*2+1 = 1001) valid envelope drawers.
+    const TOTAL = CHANNEL_TRANSCRIPT_CAP * 3;
+    for (let i = 0; i < TOTAL; i++) {
+      const ts = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
+      backend.drawers.push({
+        id: `huge-${i}`,
+        wing: CHANNEL_TRANSCRIPT_WING,
+        room: channel,
+        content: JSON.stringify({ v: 1, ts, author: "A", text: "msg " + i }),
+        created_at: ts,
+      });
+    }
+    await writeTurn(
+      channel,
+      "A",
+      "trigger",
+      "2026-01-02T00:00:00.000Z",
+    );
+    const remaining = backend.drawers.filter(
+      (d) => d.wing === CHANNEL_TRANSCRIPT_WING && d.room === channel,
+    );
+    check(
+      `paged loop converges ${TOTAL}+1 → ${CHANNEL_TRANSCRIPT_CAP}`,
+      remaining.length === CHANNEL_TRANSCRIPT_CAP,
+      `actual=${remaining.length}`,
+    );
+    _resetBackendForTesting();
+  }
+
+  // 18. enforceCap surfaces deleteDrawer-returns-false (Comment E): the
+  // default mempalace client returns false on soft delete failure without
+  // throwing. enforceCap must log those and stop spinning when no progress
+  // is being made (otherwise it loops up to MAX_ITERATIONS).
+  sect("18. enforceCap — handles deleteDrawer returning false");
+  {
+    let listCalls = 0;
+    let deleteCalls = 0;
+    const errors: string[] = [];
+    const origError = console.error;
+    const origWarn = console.warn;
+    const capture = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    console.error = capture;
+    console.warn = capture;
+    try {
+      // Fill ≥ LIST_LIMIT (CAP*2+1 = 1001) so the "got the full set" early
+      // exit doesn't fire and we reach the no-progress check.
+      const STUCK_COUNT = CHANNEL_TRANSCRIPT_CAP * 2 + 1;
+      const stuckDrawers = Array.from({ length: STUCK_COUNT }, (_, i) => {
+        const ts = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
+        return {
+          id: `stuck-${i}`,
+          text: JSON.stringify({ v: 1, ts, author: "A", text: "x" }),
+          wing: CHANNEL_TRANSCRIPT_WING,
+          room: channel,
+        };
+      });
+      _setBackendForTesting({
+        async addDrawer() {
+          return { success: true, drawer_id: "added-1" };
+        },
+        async listDrawers() {
+          listCalls++;
+          return stuckDrawers;
+        },
+        async getDrawer() {
+          return null;
+        },
+        async deleteDrawer() {
+          deleteCalls++;
+          return false;
+        },
+        async search() {
+          return [];
+        },
+      });
+      await writeTurn(channel, "A", "x", "2026-01-01T00:00:00.000Z");
+    } finally {
+      console.error = origError;
+      console.warn = origWarn;
+      _resetBackendForTesting();
+    }
+    const overflow = CHANNEL_TRANSCRIPT_CAP * 2 + 1 - CHANNEL_TRANSCRIPT_CAP;
+    check(
+      "enforceCap stopped after no-progress iteration (single list pass)",
+      listCalls === 1,
+      `listCalls=${listCalls}`,
+    );
+    check(
+      "enforceCap attempted every overflow delete in the iter",
+      deleteCalls === overflow,
+      `deleteCalls=${deleteCalls} expected=${overflow}`,
+    );
+    check(
+      "every false-return surfaced via console.error",
+      errors.filter((e) => e.includes("returned false")).length === overflow,
+      `falseErrors=${errors.filter((e) => e.includes("returned false")).length}`,
+    );
+    check(
+      "no-progress warning was logged",
+      errors.some((e) => e.includes("made no progress")),
+    );
   }
 
   console.log(`\n======\n${passed} passed, ${failed} failed`);

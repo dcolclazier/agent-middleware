@@ -9,7 +9,6 @@ import {
 } from "discord.js";
 import {
   transcribeIncoming,
-  transcribeOutgoing,
 } from "./channel-transcript.js";
 
 // --- Types ---
@@ -520,20 +519,22 @@ export class BotInstance {
 
   /**
    * Fire-and-forget: record an outgoing reply in the channel transcript.
-   * Called from sendOrAttach / sendWithFiles after a successful send. The
-   * author is this BotInstance's displayName so readVerbatimWindow's
-   * exclude-by-author filter works the same way for both incoming and
-   * outgoing turns. No-op when MEMPALACE_ENABLED=false (handled inside
-   * the module).
+   * Routes through `transcribeIncoming` keyed on the sent Discord message's
+   * id so sibling BotInstances that observe the same MessageCreate event
+   * don't write a duplicate drawer. Author is taken from `sent.author`
+   * (the bot's actual Discord username) so it matches what `handleMessage`
+   * records for inbound messages — keeping `readVerbatimWindow`'s
+   * exclude-by-author filter symmetric across directions.
+   *
+   * No-op when MEMPALACE_ENABLED=false (handled inside the module).
    */
-  private captureOutgoing(channel: TextBasedChannel, text: string): void {
-    const channelId = (channel as { id?: string }).id;
-    if (!channelId) return;
-    void transcribeOutgoing(
-      channelId,
-      this.displayName,
+  private captureOutgoing(sent: Message, text: string): void {
+    void transcribeIncoming(
+      sent.channel.id,
+      sent.id,
+      sent.author.username,
       text,
-      new Date().toISOString(),
+      new Date(sent.createdTimestamp).toISOString(),
     );
   }
 
@@ -690,8 +691,8 @@ export class BotInstance {
     const full = mention ? `${mention} ${text}` : text;
 
     if (full.length <= MESSAGE_INLINE_MAX) {
-      await (channel as TextChannel).send(full);
-      this.captureOutgoing(channel, text);
+      const sent = await (channel as TextChannel).send(full);
+      this.captureOutgoing(sent, text);
       return;
     }
 
@@ -757,11 +758,11 @@ export class BotInstance {
       out = out.slice(0, MESSAGE_INLINE_MAX);
     }
 
-    await (channel as TextChannel).send(out);
+    const sent = await (channel as TextChannel).send(out);
     // Capture the FULL pre-truncation text — the transcript is for AGENT
     // memory, not for what humans saw. Truncation is a Discord-display
     // concern.
-    this.captureOutgoing(channel, text);
+    this.captureOutgoing(sent, text);
   }
 
   /**
@@ -835,12 +836,15 @@ export class BotInstance {
     const attachments: AttachmentBuilder[] = files.map(
       (f) => new AttachmentBuilder(Buffer.from(f.content, "utf-8"), { name: f.name }),
     );
-    await (channel as TextChannel).send({ content: inline, files: attachments });
+    const sent = await (channel as TextChannel).send({
+      content: inline,
+      files: attachments,
+    });
     // Transcript records the inline summary (the human-visible prose).
     // Attachment file bodies are intentionally excluded; if a downstream
     // agent needs an attachment's contents, it should re-fetch via the
     // canon RAG / dcc layer rather than rehydrate megabytes from MemPalace.
-    this.captureOutgoing(channel, summary);
+    this.captureOutgoing(sent, summary);
   }
 
   /**
