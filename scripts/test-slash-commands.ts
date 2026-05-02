@@ -242,5 +242,39 @@ sect("9. /end payload is exposed (caller decides what to do)");
 }
 
 // ---------------------------------------------------------------------------
+// 10. Boundary character is consumed — punctuation between the verb and the
+//     payload (`:`, `,`, `?`, etc.) must NOT leak into payload. Slice 2
+//     (#15) feeds payload directly into a Claude prompt, so leading
+//     punctuation noise would change the model's input.
+// ---------------------------------------------------------------------------
+sect("10. boundary char does not leak into payload");
+{
+  const r1 = parseSlashCommand("/btw: hi");
+  check(
+    "/btw: hi → payload 'hi' (not ': hi')",
+    r1?.verb === "/btw" && r1?.payload === "hi",
+    `got ${JSON.stringify(r1)}`,
+  );
+  const r2 = parseSlashCommand("/btw, what about X?");
+  check(
+    "/btw, what about X? → payload 'what about X?'",
+    r2?.verb === "/btw" && r2?.payload === "what about X?",
+    `got ${JSON.stringify(r2)}`,
+  );
+  const r3 = parseSlashCommand("/cancel?");
+  check(
+    "/cancel? → payload '' (boundary ? consumed)",
+    r3?.verb === "/cancel" && r3?.payload === "",
+    `got ${JSON.stringify(r3)}`,
+  );
+  const r4 = parseSlashCommand("/end.");
+  check(
+    "/end. → payload '' (boundary . consumed)",
+    r4?.verb === "/end" && r4?.payload === "",
+    `got ${JSON.stringify(r4)}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n======\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
