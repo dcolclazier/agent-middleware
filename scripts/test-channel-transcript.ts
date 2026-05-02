@@ -1330,6 +1330,59 @@ async function main() {
     _resetBackendForTesting();
   }
 
+  // 27. Memory-offline warning — failure-while-notifier-null does NOT
+  // permanently suppress later warnings once a notifier is wired. Regression
+  // test for the case where writeTurn runs (e.g. an HTTP route hits
+  // channel-transcript before Discord wiring sets the notifier): the channel
+  // must remain eligible for the first postable warning.
+  sect("27. memory-offline warning — null-notifier failure does not poison flag");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    setMemoryOfflineNotifier(null);
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    // Failure occurs while no notifier is wired.
+    await writeTurn(channel, "A", "pre-wiring", "2026-12-20T00:00:00Z");
+
+    // Now the bot wiring lands — notifier is set.
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+
+    // Next failure on the same channel should fire the warning once.
+    await writeTurn(channel, "A", "post-wiring", "2026-12-20T00:00:01Z");
+    check(
+      "post-wiring failure fires warning despite earlier null-notifier failure",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    check(
+      "warning is scoped to the channel that just failed",
+      notifications[0]?.channelId === channel,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
   console.log(`\n======\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }

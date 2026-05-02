@@ -226,9 +226,13 @@ function reportMpFailure(channelId: string, reason: string): void {
     `[channel-transcript] MemPalace failure for room=${channelId}: ${reason}`,
   );
   if (memoryOfflineWarned.get(channelId) === true) return;
-  memoryOfflineWarned.set(channelId, true);
   const notifier = memoryOfflineNotifier;
   if (!notifier) return;
+  // Mark warned only when we actually attempt to notify. Setting the flag
+  // unconditionally would let a failure in a non-Discord context (e.g. an
+  // HTTP route hitting writeTurn before bot wiring) permanently suppress the
+  // first postable warning until a MemPalace success clears it.
+  memoryOfflineWarned.set(channelId, true);
   try {
     const r = notifier(channelId, MEMORY_OFFLINE_WARNING);
     if (r && typeof (r as Promise<void>).then === "function") {

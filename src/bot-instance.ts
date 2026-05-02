@@ -795,7 +795,7 @@ export class BotInstance {
     try {
       const channel = await this.client.channels.fetch(channelId);
       if (!channel || !channel.isTextBased() || !("send" in channel)) return;
-      await (channel as TextChannel).send(text);
+      await channel.send(text);
     } catch (err) {
       console.error(
         `[${this.displayName}] postSystemNotice failed for channel=${channelId}: ${err instanceof Error ? err.message : String(err)}`,
