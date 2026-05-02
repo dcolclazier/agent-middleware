@@ -20,7 +20,8 @@
     "smoketest:qwen-tools": "tsx scripts/qwen-tool-smoketest.ts",
     "smoketest:persona-budget": "tsx scripts/test-persona-budget.ts",
     "smoketest:oversize-turn": "tsx scripts/test-oversize-turn.ts",
-    "smoketest:channel-transcript": "tsx scripts/test-channel-transcript.ts"
+    "smoketest:channel-transcript": "tsx scripts/test-channel-transcript.ts",
+    "smoketest:mempalace-warning": "tsx scripts/test-mempalace-warning.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

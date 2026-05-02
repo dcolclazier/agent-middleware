@@ -783,6 +783,26 @@ export class BotInstance {
 
   // --- Discord helpers ---
 
+  /**
+   * Post a short system notice (e.g. the issue #8 memory-offline warning) to
+   * a channel. Failure is non-fatal — system notices are best-effort by
+   * design. Skips transcript capture: these are infrastructure noise, not
+   * conversation, and writing them back to MemPalace during an outage would
+   * just retry the same broken connection.
+   */
+  async postSystemNotice(channelId: string, text: string): Promise<void> {
+    if (!this.client) return;
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !channel.isTextBased() || !("send" in channel)) return;
+      await (channel as TextChannel).send(text);
+    } catch (err) {
+      console.error(
+        `[${this.displayName}] postSystemNotice failed for channel=${channelId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   async safeReact(channelId: string, messageId: string, emoji: string): Promise<void> {
     if (!this.client) return;
     try {

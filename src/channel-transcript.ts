@@ -43,6 +43,15 @@
  *    _resetCacheForTesting pattern from src/qwen-persona.ts introduced in
  *    PR #9). The default backend wraps mempalace-client.ts; tests substitute
  *    an in-memory backend.
+ *
+ * 6. Memory-offline warning (issue #8): a per-channel boolean tracks whether
+ *    the in-channel "memory offline" notice has already been posted in the
+ *    current outage. The first failure (mpAddDrawer/mpSearch/searchProse
+ *    via this module) fires a notifier callback once; subsequent failures
+ *    on the same channel are silent until the next successful call clears
+ *    the flag. The notifier is wired by the bot layer (see
+ *    discord-bot.ts:startDiscordBot) — channel-transcript itself has no
+ *    Discord client, so the API is callback-based.
  */
 
 import {
@@ -51,8 +60,9 @@ import {
   mpGetDrawer,
   mpListDrawers,
   mpDeleteDrawer,
-  mpSearch,
+  mpSearchResult,
   type DrawerEntry,
+  type MpResult,
   type SearchResult,
 } from "./mempalace-client.js";
 
@@ -69,6 +79,14 @@ export const CHANNEL_TRANSCRIPT_WING = "conversation";
  * messages are filtered upstream (slice #5).
  */
 export const CHANNEL_TRANSCRIPT_CAP = 500;
+
+/**
+ * Canonical in-channel notice posted on the first MemPalace failure per
+ * outage per channel. Issue #8: warn the user once that recall is offline so
+ * agents speaking past each other have an interpretable cause.
+ */
+export const MEMORY_OFFLINE_WARNING =
+  "⚠ memory offline — operating context-blind";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,6 +125,11 @@ export interface TranscriptBackend {
    */
   getDrawer(id: string): Promise<DrawerEntry | null>;
   deleteDrawer(id: string): Promise<boolean>;
+  /**
+   * Returns the raw search hits on success (which may be empty), or throws on
+   * timeout / network error. The throw — vs an empty array — is what lets
+   * `searchProse` distinguish "no matches" from "MemPalace down" (issue #8).
+   */
   search(
     query: string,
     opts?: { wing?: string; room?: string; limit?: number },
@@ -133,7 +156,12 @@ const defaultBackend: TranscriptBackend = {
     return mpDeleteDrawer(id);
   },
   async search(query, opts) {
-    return mpSearch(query, opts);
+    // Use the tagged-variant API so failure → throw → searchProse can fire
+    // the memory-offline warning. The plain `mpSearch` swallows errors as []
+    // and would lose the distinction (issue #8).
+    const r: MpResult<SearchResult[]> = await mpSearchResult(query, opts);
+    if (!r.ok) throw new Error(r.reason);
+    return r.value;
   },
 };
 
@@ -150,6 +178,83 @@ export function _setBackendForTesting(b: TranscriptBackend): void {
 
 export function _resetBackendForTesting(): void {
   backend = defaultBackend;
+}
+
+// ---------------------------------------------------------------------------
+// Memory-offline warning (issue #8). Channel-transcript is the single
+// integration point for MemPalace calls scoped to a Discord channel
+// (writeTurn / readVerbatimWindow / searchProse), which is why the warning
+// logic lives here rather than in mempalace-client.ts: the client speaks
+// MemPalace primitives, not channels, so it has no place to track per-channel
+// outage state. The brief authorises either location; channel-transcript is
+// preferred precisely because it already owns the channelId boundary.
+//
+// State: per-channel "warning has been posted in this outage" flag. On the
+// next successful call the flag clears so a subsequent outage re-fires once.
+// Notifier: optional callback the bot layer installs to post the in-channel
+// notice. When unset (e.g. middleware HTTP routes hit channel-transcript
+// outside a Discord context), failures are still logged but no message is
+// emitted.
+// ---------------------------------------------------------------------------
+
+export type MemoryOfflineNotifier = (
+  channelId: string,
+  message: string,
+) => void | Promise<void>;
+
+const memoryOfflineWarned = new Map<string, boolean>();
+let memoryOfflineNotifier: MemoryOfflineNotifier | null = null;
+
+export function setMemoryOfflineNotifier(n: MemoryOfflineNotifier | null): void {
+  memoryOfflineNotifier = n;
+}
+
+export function _resetMemoryOfflineStateForTesting(): void {
+  memoryOfflineWarned.clear();
+}
+
+/**
+ * Mark a MemPalace call for `channelId` as failed. If this is the FIRST
+ * failure since the last success, fires the notifier once. Subsequent
+ * failures while the flag is set are silent.
+ *
+ * Notifier errors are caught here so the bot's reply path is never broken
+ * by a Discord post failure (issue #8 acceptance: bot must still respond).
+ */
+function reportMpFailure(channelId: string, reason: string): void {
+  console.error(
+    `[channel-transcript] MemPalace failure for room=${channelId}: ${reason}`,
+  );
+  if (memoryOfflineWarned.get(channelId) === true) return;
+  memoryOfflineWarned.set(channelId, true);
+  const notifier = memoryOfflineNotifier;
+  if (!notifier) return;
+  try {
+    const r = notifier(channelId, MEMORY_OFFLINE_WARNING);
+    if (r && typeof (r as Promise<void>).then === "function") {
+      (r as Promise<void>).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[channel-transcript] memory-offline notifier rejected: ${msg}`,
+        );
+      });
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[channel-transcript] memory-offline notifier threw: ${msg}`);
+  }
+}
+
+/**
+ * Mark a MemPalace call for `channelId` as successful. Clears the
+ * per-channel offline flag so a fresh outage re-fires the warning once.
+ * Empty-but-successful results are also "success" — only timeouts / errors
+ * trigger the warning.
+ */
+function reportMpSuccess(channelId: string): void {
+  if (memoryOfflineWarned.get(channelId) === true) {
+    memoryOfflineWarned.delete(channelId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,15 +435,17 @@ export async function writeTurn(
         content,
       );
       if (!result.success) {
-        console.error(
-          `[channel-transcript] addDrawer failed for room=${channelId}: ${result.error ?? "unknown"}`,
-        );
+        // Soft failure (HTTP error caught by mempalace-client). Issue #8.
+        reportMpFailure(channelId, result.error ?? "unknown");
         return;
       }
+      // Successful write — clear any prior offline flag for this channel.
+      reportMpSuccess(channelId);
       await enforceCap(channelId);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[channel-transcript] writeTurn failed: ${msg}`);
+      reportMpFailure(channelId, msg);
     }
   });
 }
@@ -424,12 +531,15 @@ export async function searchProse(
     };
     if (channelId !== undefined) opts.room = channelId;
     const results = await backend.search(query, opts);
+    // Issue #8: empty result is a success — only the throw path is a failure.
+    if (channelId !== undefined) reportMpSuccess(channelId);
     return results
       .map(entryFromSearchResult)
       .filter((e): e is TranscriptEntry => e !== null);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[channel-transcript] searchProse failed: ${msg}`);
+    if (channelId !== undefined) reportMpFailure(channelId, msg);
     return [];
   }
 }

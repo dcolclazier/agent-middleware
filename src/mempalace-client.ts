@@ -118,13 +118,25 @@ export function isEnabled(): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Search drawers. Replaces both `recall()` (with wing="qwen") and
- * `readFactsAsString()` (with wing="shared").
+ * Tagged-variant outcome for memory-state-sensitive callers (issue #8).
+ * `mpSearch` keeps returning `T[]` for back-compat — empty array can mean
+ * either "no matches" OR "call errored and was swallowed". Callers that
+ * need to distinguish those two (channel-transcript's failure-warning
+ * logic) call `mpSearchResult` instead, which surfaces the difference.
  */
-export async function mpSearch(
+export type MpResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: string };
+
+/**
+ * Search drawers (tagged-variant form). Returns `{ ok: false, reason }` on
+ * timeout or HTTP error; `{ ok: true, value: [] }` on a successful empty
+ * result. Issue #8 — used by channel-transcript to distinguish the two.
+ */
+export async function mpSearchResult(
   query: string,
   opts?: { wing?: string; room?: string; limit?: number },
-): Promise<SearchResult[]> {
+): Promise<MpResult<SearchResult[]>> {
   try {
     const resp = await api<SearchResponse>("POST", "/search", {
       query,
@@ -132,11 +144,27 @@ export async function mpSearch(
       wing: opts?.wing,
       room: opts?.room,
     });
-    return resp.results ?? [];
+    return { ok: true, value: resp.results ?? [] };
   } catch (err: any) {
-    console.error(`[mempalace] search failed: ${err?.message ?? err}`);
-    return [];
+    const reason = err?.message ?? String(err);
+    console.error(`[mempalace] search failed: ${reason}`);
+    return { ok: false, reason };
   }
+}
+
+/**
+ * Search drawers. Replaces both `recall()` (with wing="qwen") and
+ * `readFactsAsString()` (with wing="shared").
+ *
+ * Back-compat shape: returns `[]` on empty success AND on error — callers
+ * that need to tell those apart should use `mpSearchResult`.
+ */
+export async function mpSearch(
+  query: string,
+  opts?: { wing?: string; room?: string; limit?: number },
+): Promise<SearchResult[]> {
+  const r = await mpSearchResult(query, opts);
+  return r.ok ? r.value : [];
 }
 
 /**
