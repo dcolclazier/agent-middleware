@@ -1,3 +1,8 @@
+// `.env` must be parsed BEFORE any other module is imported, because many
+// modules (qwen-persona, claude-runner, mempalace-client, ...) capture
+// `process.env.*` at module-init time. See bootstrap-env.ts.
+import "./bootstrap-env.js";
+
 import express from "express";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "url";
@@ -28,26 +33,6 @@ import {
 } from "./canon-commit.js";
 import { runQwenTurn, getQwenSession } from "./qwen-harness.js";
 import { loadPersona } from "./qwen-persona.js";
-
-// Load .env manually (no dotenv dependency)
-import { readFileSync } from "fs";
-try {
-  const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
-  const envContent = readFileSync(envPath, "utf-8");
-  for (const line of envContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const value = trimmed.slice(eqIdx + 1).trim();
-    if (!process.env[key]) {
-      process.env[key] = value;
-    }
-  }
-} catch {
-  // .env is optional
-}
 
 // --- Process-level crash safety ---
 //

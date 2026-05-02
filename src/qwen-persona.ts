@@ -113,7 +113,6 @@ async function readAll(): Promise<{ persona: Persona; mtimes: Record<string, num
 async function refreshIfStale(): Promise<void> {
   const now = Date.now();
   if (_cache && now - _lastCheckAt < TTL_MS) return; // still fresh
-  _lastCheckAt = now;
 
   // Cheap mtime check before re-reading file contents. Only read if any
   // mtime has changed since we last cached.
@@ -132,7 +131,10 @@ async function refreshIfStale(): Promise<void> {
           break;
         }
       }
-      if (!changed) return;
+      if (!changed) {
+        _lastCheckAt = now;
+        return;
+      }
     } catch {
       // Fall through to full reload.
     }
@@ -141,13 +143,14 @@ async function refreshIfStale(): Promise<void> {
   const { persona, mtimes } = await readAll();
   const check = checkPersonaBudget(persona);
   if (!check.ok) {
-    // If _cache was populated, this is a reload (a previous load succeeded
-    // and we're refreshing because mtime changed). Log loudly with a
-    // distinct prefix so the supervisor's FATAL handler picks up the right
-    // context — the error itself still propagates so panicFlushAndExit
-    // exits non-zero. Without this log, an mtime-bumped over-budget edit
-    // would surface as a generic unhandledRejection rather than a clearly
-    // attributed persona problem.
+    // Reload-over-budget is *not* fully fatal at runtime: ADR-0003 scopes
+    // fail-fast to startup, and runQwenTurn's outer try/catch swallows the
+    // throw and surfaces it as a user-facing harness error. We log with a
+    // [FATAL persona] prefix so the supervisor's log scraper still flags
+    // it for the operator to fix, and we deliberately do NOT bump
+    // _lastCheckAt — leaving it stale so the next loadPersona() call
+    // re-attempts the read and re-logs, rather than silently serving
+    // stale persona for a TTL window after a broken edit.
     if (_cache !== null) {
       console.error(
         `[FATAL persona] over budget post-reload: ${check.total} tokens`,
@@ -157,6 +160,7 @@ async function refreshIfStale(): Promise<void> {
   }
   _cache = persona;
   _cachedMtimes = mtimes;
+  _lastCheckAt = now;
   console.log(`[qwen-persona] reloaded (${Object.keys(mtimes).length} files)`);
 }
 
