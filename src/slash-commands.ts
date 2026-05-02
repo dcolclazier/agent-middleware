@@ -34,16 +34,23 @@ export interface SlashCommand {
 const KNOWN_VERBS: ReadonlySet<string> = new Set(["/btw", "/cancel", "/end"]);
 
 // Match: optional leading whitespace, the verb (alphabetic only after the
-// slash), then either end-of-string OR a single non-letter boundary char
-// (whitespace, punctuation, etc.) which IS consumed so it doesn't leak
-// into the payload — a previous lookahead-only form left punctuation
-// like `/btw: hi` parsing to payload `": hi"`.
+// slash), then either end-of-string OR a single non-word boundary char
+// (\W = anything not [A-Za-z0-9_]) which IS consumed so it doesn't leak
+// into the payload.
+//
+// Why \W (not [^a-z]) for the boundary: the looser form treats digits and
+// underscore as boundaries, which would parse `/end2end` as `/end` with
+// payload `end` (verb capture stops at `2`, then `[^a-z]` consumes the
+// `2`) — accidentally triggering /end and clearing the channel mapping.
+// \W requires a real word break (whitespace, punctuation, end-of-string),
+// so identifier-shaped tokens like `/end2`, `/cancel_foo`, `/end2end`
+// fail to match this regex outright and parseSlashCommand returns null.
 //
 // Capture group 1 = verb (lowercased before lookup).
-// Capture group 2 = the rest of the message AFTER the consumed boundary.
-// If the verb ended the string, the alternation hits `$` (zero-width) and
-// group 2 is empty.
-const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?:$|[^a-z])([\s\S]*)$/i;
+// Capture group 2 = the rest of the message AFTER the consumed boundary
+// (the boundary char itself is NOT in group 2). If the verb ended the
+// string, the alternation hits `$` (zero-width) and group 2 is empty.
+const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?:$|\W)([\s\S]*)$/i;
 
 /**
  * Parse a channel message body for a slash-command verb.
@@ -66,9 +73,9 @@ export function parseSlashCommand(content: string): SlashCommand | null {
   const verb = (m[1] ?? "").toLowerCase();
   if (!KNOWN_VERBS.has(verb)) return null;
 
-  // Everything after the verb's word-boundary char. The boundary char itself
-  // (whitespace or punctuation) lives in group 2's leading position; trim
-  // and collapse internal whitespace so the payload is normalized.
+  // Group 2 is everything AFTER the boundary char (which the regex
+  // consumed). Collapse runs of internal whitespace and trim so the
+  // payload is normalized — e.g. `/btw    what    now` → "what now".
   const rawPayload = m[2] ?? "";
   const payload = rawPayload.replace(/\s+/g, " ").trim();
 

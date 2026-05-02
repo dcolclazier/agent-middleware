@@ -276,5 +276,39 @@ sect("10. boundary char does not leak into payload");
 }
 
 // ---------------------------------------------------------------------------
+// 11. Boundary excludes word-continuation chars (digits, underscore). With
+//     the looser [^a-z] form, `/end2end` would have parsed as /end with
+//     payload "end" — accidentally clearing the channel mapping.
+// ---------------------------------------------------------------------------
+sect("11. boundary requires \\W (digits/underscore not allowed)");
+{
+  check(
+    "/end2 → null (digit is not a boundary)",
+    parseSlashCommand("/end2") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end2"))}`,
+  );
+  check(
+    "/end2end → null (digit boundary refused)",
+    parseSlashCommand("/end2end") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end2end"))}`,
+  );
+  check(
+    "/cancel123 → null (digit boundary refused)",
+    parseSlashCommand("/cancel123") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancel123"))}`,
+  );
+  check(
+    "/cancel_foo → null (underscore boundary refused)",
+    parseSlashCommand("/cancel_foo") === null,
+    `got ${JSON.stringify(parseSlashCommand("/cancel_foo"))}`,
+  );
+  check(
+    "/end_of_file → null (underscore boundary refused)",
+    parseSlashCommand("/end_of_file") === null,
+    `got ${JSON.stringify(parseSlashCommand("/end_of_file"))}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 console.log(`\n======\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
