@@ -775,12 +775,17 @@ function applyRollingWindow(session: QwenSession): void {
  * VERBATIM_WINDOW_BUDGET tokens, oldest entries are dropped first until it
  * fits. Returns the empty string when the window is empty or every entry
  * would have been trimmed away — callers omit the block in that case.
+ *
+ * Newlines inside `entry.text` (Discord messages can contain them) are
+ * collapsed to spaces so each drawer renders on its own line; the brief's
+ * format contract is one entry per line.
  */
 function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
   if (entries.length === 0) return "";
-  const lines = entries.map(
-    (e) => `${e.timestamp} ${e.author}: ${e.text}`,
-  );
+  const lines = entries.map((e) => {
+    const flatText = e.text.replace(/\r?\n/g, " ");
+    return `${e.timestamp} ${e.author}: ${flatText}`;
+  });
   let i = 0;
   while (i < lines.length) {
     const candidate = `[CHANNEL CONVERSATION]\n${lines.slice(i).join("\n")}`;

@@ -369,6 +369,43 @@ async function main() {
     );
   }
 
+  // 7a. Newlines inside entry.text are collapsed to single-line shape.
+  sect("7a. multi-line entry.text → flattened to one line per entry");
+  {
+    const entries: TranscriptEntry[] = [
+      makeEntry(
+        "ch",
+        "Alice",
+        "line1\nline2\r\nline3",
+        "2026-04-30T12:00:00Z",
+      ),
+      makeEntry("ch", "Bob", "single", "2026-04-30T12:00:01Z"),
+    ];
+    const prompt = buildSystemPrompt({
+      persona: fakePersona,
+      memories: [],
+      facts: "",
+      channelState: "",
+      tools: noTools,
+      verbatimWindow: entries,
+    });
+    const headerIdx = prompt.indexOf("[CHANNEL CONVERSATION]");
+    const after = prompt.slice(headerIdx);
+    const blank = after.indexOf("\n\n");
+    const block = blank >= 0 ? after.slice(0, blank) : after;
+    // Header + 2 entry lines = exactly 3 lines.
+    const lineCount = block.split("\n").length;
+    check(
+      "block has exactly 3 lines (header + 2 flattened entries)",
+      lineCount === 3,
+      `got ${lineCount}`,
+    );
+    check(
+      "Alice's flattened text contains all three segments inline",
+      block.includes("Alice: line1 line2 line3"),
+    );
+  }
+
   // 7. INSTRUCTIONS block reflects the new verbatim-recall capability.
   sect("7. INSTRUCTIONS mentions [CHANNEL CONVERSATION]");
   {
