@@ -188,6 +188,25 @@ sect("6. verb must be word-bounded");
     "/btwthing is not /btw",
     parseSlashCommand("/btwthing question") === null,
   );
+  // Digits and underscores are not valid verb boundaries either — `/end2`
+  // and `/cancel_all` must NOT silently parse as `/end` with payload `"2"`
+  // or `/cancel` with payload `"_all"`.
+  check(
+    "/end2 is not /end (digit boundary)",
+    parseSlashCommand("/end2 of file") === null,
+  );
+  check(
+    "/cancel123 is not /cancel (digit boundary)",
+    parseSlashCommand("/cancel123") === null,
+  );
+  check(
+    "/btw9 is not /btw (digit boundary)",
+    parseSlashCommand("/btw9 question") === null,
+  );
+  check(
+    "/cancel_all is not /cancel (underscore boundary)",
+    parseSlashCommand("/cancel_all now") === null,
+  );
   // But verb followed by punctuation IS allowed.
   check(
     "/cancel: please",

@@ -38,16 +38,19 @@ export interface SlashCommand {
 
 const KNOWN_VERBS: ReadonlySet<string> = new Set(["/btw", "/cancel", "/end"]);
 
-// Match: optional leading whitespace, the verb (alphanumeric only after the
-// slash), then either end-of-string OR a non-letter character (whitespace,
-// punctuation, etc.). The `[a-z]+` character class is intentionally narrow
-// so future verbs like `/cancel-all` would need an explicit parser update
-// rather than silently matching as `/cancel` with payload `-all`.
+// Match: optional leading whitespace, the verb (lowercase letters only after
+// the slash), then either end-of-string OR a non-alphanumeric, non-underscore
+// character (whitespace, punctuation, etc.). The boundary class
+// `[^a-z0-9_]` excludes digits and underscores so inputs like `/end2` or
+// `/cancel_all` are NOT silently parsed as `/end` / `/cancel` with a
+// digit/underscore-prefixed payload — adding a new verb that includes
+// digits or underscores requires an explicit parser update rather than a
+// silent match.
 //
 // Capture group 1 = verb (lowercased before lookup).
 // Capture group 2 = the rest of the message AFTER the verb's trailing
 // boundary character. If the verb ended the string, group 2 is empty.
-const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?=$|[^a-z])([\s\S]*)$/i;
+const SLASH_CMD_RE = /^\s*(\/[a-z]+)(?=$|[^a-z0-9_])([\s\S]*)$/i;
 
 /**
  * Parse a channel message body for a slash-command verb.
