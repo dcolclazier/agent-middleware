@@ -27,8 +27,13 @@ export { knownBotIds };
 // Owns the session lifecycle, channel history prepending, reset / catch-up
 // directives, and follow-up routing. This is the Claude-specific behavior
 // that lived in the old module-level handleMessage.
+//
+// Exported so integration tests (scripts/test-slash-integration.ts) can
+// drive the handler end-to-end with a stubbed Discord Message — i.e. through
+// the slash dispatch and runner interactions — without booting a real
+// Discord client.
 
-const claudeHandler: BotMessageHandler = async (
+export const claudeHandler: BotMessageHandler = async (
   self: BotInstance,
   message: Message,
   initialContent: string,
