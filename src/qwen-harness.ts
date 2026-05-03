@@ -1427,10 +1427,11 @@ export async function runQwenTurn(
 
     // Verbatim window — last K non-self channel-transcript entries, fetched
     // once per turn (issue #6). Self-author identity comes from the caller
-    // (qwen-bot.ts sources it from the live Discord client; HTTP test paths
-    // omit it, in which case readVerbatimWindow falls back to "" and any
-    // self-authored entries that may exist will pass through — acceptable
-    // for the test path because no real bot is replying there).
+    // (qwen-bot.ts sources it from the live Discord client; the HTTP test
+    // path at /api/qwen/test now accepts an optional `selfAuthor` body
+    // field). When omitted, readVerbatimWindow falls back to "" and any
+    // self-authored entries that may exist will pass through — only safe
+    // for synthetic test channels with no historical Qwen entries.
     const verbatimWindow = await readVerbatimWindow(
       channelId,
       selfAuthor ?? "",
