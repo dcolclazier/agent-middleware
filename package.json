@@ -21,6 +21,8 @@
     "smoketest:persona-budget": "tsx scripts/test-persona-budget.ts",
     "smoketest:oversize-turn": "tsx scripts/test-oversize-turn.ts",
     "smoketest:channel-transcript": "tsx scripts/test-channel-transcript.ts",
+    "smoketest:verbatim-window": "tsx scripts/test-verbatim-window.ts",
+    "smoketest:topical-recall": "tsx scripts/test-topical-recall.ts",
     "smoketest:mempalace-warning": "tsx scripts/test-mempalace-warning.ts"
   },
   "dependencies": {

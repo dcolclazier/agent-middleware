@@ -539,12 +539,25 @@ app.post("/api/middleware/restart", (req, res) => {
 // --- Qwen harness smoke endpoint (Phase 1) ---
 //
 // POST /api/qwen/test
-// Body: { channelId?: string, prompt: string }
+// Body: { channelId?: string, prompt: string, selfAuthor?: string }
 // Exercises runQwenTurn() end-to-end: tool loop, session persistence, stop
 // conditions, etc. Gated by the same canonAuth middleware so only the LAN
 // allowlist with the canon token can drive it. No Discord side-effects.
+//
+// `selfAuthor` mirrors the value qwen-bot.ts sources from the live Discord
+// client and threads into runQwenTurn for verbatim-window self-exclusion.
+// Optional here so existing callers keep working; pass the Qwen bot's
+// Discord username when driving a real channel id whose transcript already
+// contains Qwen entries — without it, the verbatim window will include
+// any prior Qwen-authored entries in this channel (production self-excludes
+// via getBotUsername()), corrupting topical retrieval and producing a
+// prompt shape that doesn't match the real Discord path.
 app.post("/api/qwen/test", canonAuth, async (req, res) => {
-  const body = (req.body ?? {}) as { channelId?: string; prompt?: string };
+  const body = (req.body ?? {}) as {
+    channelId?: string;
+    prompt?: string;
+    selfAuthor?: string;
+  };
   const prompt = body.prompt;
   if (!prompt || typeof prompt !== "string") {
     res.status(400).json({ error: "prompt is required (string)" });
@@ -553,9 +566,13 @@ app.post("/api/qwen/test", canonAuth, async (req, res) => {
   const channelId = body.channelId && typeof body.channelId === "string"
     ? body.channelId
     : "test-channel";
+  const selfAuthor =
+    typeof body.selfAuthor === "string" && body.selfAuthor.length > 0
+      ? body.selfAuthor
+      : undefined;
 
   try {
-    const result = await runQwenTurn(channelId, prompt);
+    const result = await runQwenTurn(channelId, prompt, selfAuthor);
     const session = await getQwenSession(channelId);
     // ADR-0003: surface per-turn wire budget metrics for the request that
     // was actually sent (post-compression, post-pre-flight). Defaults to

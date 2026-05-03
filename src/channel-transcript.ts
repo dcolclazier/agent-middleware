@@ -471,6 +471,26 @@ export async function writeTurn(
 }
 
 /**
+ * Resolve when all in-flight `transcribeIncoming` / `writeTurn` calls for
+ * `channelId` have settled (succeeded or failed). Use this as a write
+ * barrier before reading the verbatim window so the read sees writes that
+ * the Discord layer fired-and-forgot for the message currently driving the
+ * turn.
+ *
+ * Implementation note: the per-channel lock chain (`channelLocks`) holds
+ * the latest settled-or-pending tail of each channel's serial write queue.
+ * Awaiting it gives us an unconditional "all prior writes finished"
+ * barrier without coupling readers to MemPalace round-trip latency on the
+ * write path itself (writes remain fire-and-forget at the call site).
+ *
+ * No-op (resolves immediately) when no writes are pending or have ever
+ * been issued for this channel.
+ */
+export function awaitPendingWrites(channelId: string): Promise<void> {
+  return channelLocks.get(channelId) ?? Promise.resolve();
+}
+
+/**
  * Return the most recent K transcript entries for `channelId` whose author
  * is NOT `excludeAuthor`. Result is ordered oldest-to-newest so callers can
  * splice it directly into a chronological prompt.
