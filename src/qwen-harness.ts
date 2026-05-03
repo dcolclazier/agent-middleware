@@ -164,6 +164,17 @@ export interface QwenSession {
   hadCommitDuringThisTask: boolean;
   lastUserMessageRequestedCanon: boolean;
   /**
+   * Append-only log of the human-typed user messages that drove this
+   * session, in arrival order. Distinct from `messages` because the harness
+   * also appends synthetic `role: "user"` entries for steering (e.g. the
+   * text-only-gate canon-commit pushback at runQwenTurn). Topical-recall
+   * query construction (`buildLastUserMessagesQuery`) reads from this so
+   * mid-loop middleware nudges don't skew retrieval. Optional for
+   * backward-compat with sessions persisted before this field existed —
+   * the helper falls back to scanning `messages` when absent.
+   */
+  humanUserMessages?: string[];
+  /**
    * Messages-count snapshot at the last successful maybeRemember() write.
    * Used so the "every N user/assistant turns" rule fires on deltas rather
    * than exact multiples (which miss easily under varying turn shapes).
@@ -395,6 +406,7 @@ function createSession(channelId: string): QwenSession {
     toolFailures: {},
     hadCommitDuringThisTask: false,
     lastUserMessageRequestedCanon: false,
+    humanUserMessages: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -875,8 +887,15 @@ function renderProseBlock(entries: TranscriptEntry[]): string {
 /**
  * Build the search query used by the topical-decisions and topical-prose
  * searches in runQwenTurn. Returns the concatenation (joined by newlines)
- * of the last `n` user messages in `session.messages`. If fewer than `n`
- * user messages exist, returns whatever is available; if none, "".
+ * of the last `n` HUMAN user messages in this session. If fewer than `n`
+ * human messages exist, returns whatever is available; if none, "".
+ *
+ * Reads from `session.humanUserMessages` so synthetic harness pushbacks
+ * (e.g. the text-only-gate canon-commit nudge in runQwenTurn, which also
+ * pushes `role: "user"`) don't pollute the retrieval query — that would
+ * skew topical recall exactly when Qwen is already off-track. Falls back
+ * to scanning `session.messages` when the field is absent (sessions
+ * persisted before this field was added).
  *
  * Buffers single-message conversational pivots ("ok", "yes") against the
  * topical context they're responding to — see issue #7.
@@ -886,6 +905,12 @@ export function buildLastUserMessagesQuery(
   n = 3,
 ): string {
   if (n <= 0) return "";
+  if (session.humanUserMessages) {
+    return session.humanUserMessages.slice(-n).join("\n");
+  }
+  // Backward-compat path: pre-humanUserMessages session JSON. Scan messages
+  // and accept the (small) risk of synthetic pushback inclusion until the
+  // session next sees a fresh user turn and migrates onto the new field.
   const userTexts: string[] = [];
   for (const m of session.messages) {
     const msg = m as { role?: string; content?: unknown };
@@ -1412,6 +1437,13 @@ export async function runQwenTurn(
 
     // Fresh user message: reset per-message counters.
     session.messages.push({ role: "user", content: userMessage });
+    // Track real human input separately from synthetic harness pushbacks
+    // (text-only-gate canon-commit nudge etc., which also push role:"user").
+    // `buildLastUserMessagesQuery` reads this for topical retrieval so
+    // mid-loop middleware nudges don't skew the recall query. Lazily
+    // initialise for sessions persisted before this field existed.
+    if (!session.humanUserMessages) session.humanUserMessages = [];
+    session.humanUserMessages.push(userMessage);
     session.currentTurn = 0;
     session.toolFailures = {};
     session.hadCommitDuringThisTask = false;

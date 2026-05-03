@@ -41,7 +41,10 @@ const noTools: never[] = [];
 
 function makeSession(userMessages: string[]): QwenSession {
   // Interleave assistant messages between user messages to mimic a real turn
-  // history; the helper must filter to role=user only.
+  // history. The helper now reads `humanUserMessages` (synthetic-pushback
+  // resilient); we mirror that field here to match what runQwenTurn does in
+  // production. Tests in `1b` exercise the legacy `messages`-only fallback
+  // for sessions persisted before `humanUserMessages` existed.
   const messages: any[] = [];
   for (let i = 0; i < userMessages.length; i++) {
     messages.push({ role: "user", content: userMessages[i] });
@@ -56,6 +59,7 @@ function makeSession(userMessages: string[]): QwenSession {
     toolFailures: {},
     hadCommitDuringThisTask: false,
     lastUserMessageRequestedCanon: false,
+    humanUserMessages: [...userMessages],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -76,6 +80,65 @@ async function main() {
     check(
       "query equals concatenation of last 3 user messages joined by newline",
       q === "third user message\nfourth user message\nfifth user message",
+      `got: ${JSON.stringify(q)}`,
+    );
+  }
+
+  // 1a. Synthetic harness pushbacks (also pushed as role:"user" — e.g. the
+  // text-only-gate canon-commit nudge in runQwenTurn) must NOT leak into
+  // the topical-recall query. Only entries in `humanUserMessages` count.
+  sect(
+    "1a. synthetic role:'user' pushbacks in messages don't leak into query",
+  );
+  {
+    const session = makeSession(["real human turn one", "real human turn two"]);
+    // Inject a synthetic harness pushback into `messages` (mirrors what
+    // runQwenTurn does at the text-only gate) — this entry is role:"user"
+    // but isn't a human-typed message, so the query must skip it.
+    session.messages.push({
+      role: "user",
+      content:
+        "You produced a text-only response but the task asked for canon work and you did not call canon_commit. Commit your work now or call task_complete with an explanation.",
+    });
+    const q = buildLastUserMessagesQuery(session, 3);
+    check(
+      "synthetic pushback content is absent from query",
+      !q.includes("Commit your work now"),
+      `got: ${JSON.stringify(q)}`,
+    );
+    check(
+      "real human messages remain in query",
+      q.includes("real human turn one") && q.includes("real human turn two"),
+      `got: ${JSON.stringify(q)}`,
+    );
+  }
+
+  // 1b. Legacy session JSON without `humanUserMessages` falls back to
+  // scanning `messages` (backward-compat path). Documents the trade-off:
+  // legacy sessions lose synthetic-exclusion until they next see a fresh
+  // human turn and migrate onto the new field.
+  sect("1b. legacy session (no humanUserMessages) falls back to messages scan");
+  {
+    const legacy: QwenSession = {
+      id: "legacy",
+      channelId: "x",
+      messages: [
+        { role: "user", content: "legacy msg one" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "legacy msg two" },
+      ],
+      taskState: "idle",
+      currentTurn: 0,
+      toolFailures: {},
+      hadCommitDuringThisTask: false,
+      lastUserMessageRequestedCanon: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const q = buildLastUserMessagesQuery(legacy, 3);
+    check(
+      "legacy session falls back to scanning messages and joins user entries",
+      q === "legacy msg one\nlegacy msg two",
       `got: ${JSON.stringify(q)}`,
     );
   }
