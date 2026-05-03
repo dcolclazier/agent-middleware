@@ -548,8 +548,10 @@ app.post("/api/middleware/restart", (req, res) => {
 // client and threads into runQwenTurn for verbatim-window self-exclusion.
 // Optional here so existing callers keep working; pass the Qwen bot's
 // Discord username when driving a real channel id whose transcript already
-// contains Qwen entries — otherwise the test path's prompt shape diverges
-// from the production Discord path.
+// contains Qwen entries — without it, the verbatim window will include
+// any prior Qwen-authored entries in this channel (production self-excludes
+// via getBotUsername()), corrupting topical retrieval and producing a
+// prompt shape that doesn't match the real Discord path.
 app.post("/api/qwen/test", canonAuth, async (req, res) => {
   const body = (req.body ?? {}) as {
     channelId?: string;

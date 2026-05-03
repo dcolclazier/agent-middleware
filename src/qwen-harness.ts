@@ -841,8 +841,10 @@ function sanitizeAuthor(author: string): string {
 /**
  * Render a `[CHANNEL CONVERSATION]` block from a verbatim window of transcript
  * entries (oldest-to-newest). If the rendered block exceeds
- * VERBATIM_WINDOW_BUDGET tokens, oldest entries are dropped first until it
- * fits. Returns the empty string when the window is empty or every entry
+ * VERBATIM_WINDOW_BUDGET tokens, OLDEST entries are dropped first (front
+ * trim) so the most-recent context survives — opposite trim direction from
+ * `renderDecisionsBlock` / `renderProseBlock`, which preserve high-similarity
+ * entries by dropping from the tail. Returns "" when empty or every entry
  * would have been trimmed away — callers omit the block in that case.
  */
 function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
@@ -1407,9 +1409,11 @@ const TOPICAL_DECISIONS_PER_ROOM_LIMIT = 3;
 /**
  * Run the topical-decisions fan-out. Issues N searches in parallel (one per
  * wing × room), merges their results, deduplicates by text, sorts by
- * descending similarity, and returns the de-duped list as plain strings
- * suitable for the `[RELEVANT DECISIONS]` block. Returns [] when MemPalace
- * is disabled or every search fails.
+ * descending similarity, and returns the de-duped list as **plain text
+ * strings** suitable for the `[RELEVANT DECISIONS]` block. Similarity
+ * scores drive sort + dedupe order then are discarded — the block format
+ * has no slot for them. Returns [] when MemPalace is disabled or every
+ * search fails.
  */
 async function searchTopicalDecisions(query: string): Promise<string[]> {
   if (!query.trim()) return [];
