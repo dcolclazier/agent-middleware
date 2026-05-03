@@ -1411,66 +1411,74 @@ const VERBATIM_WINDOW_K = 10;
 const HUMAN_USER_MESSAGES_CAP = 50;
 
 /**
- * Wings searched for topical durable decisions. Issue #7: decisions and
- * naming live in `qwen` (per-agent fact extraction); user preferences and
- * canon observations may also be filed under `shared` for cross-agent reach.
+ * (wing, room) pairs searched on every Qwen turn for topical durable
+ * decisions. Each tuple corresponds to a known writer somewhere in this
+ * repo — listed inline so it stays auditable when the writer surfaces
+ * change. Switched from a wing × room cross-product (iter-2) to an
+ * explicit list (iter-3) because Copilot correctly flagged that
+ * `shared/canon_observation` had no writer and was permanently empty
+ * fan-out work; the cross-product structure couldn't express
+ * "all rooms in qwen + all-rooms-except-canon_observation in shared".
+ *
+ *   qwen wing  — written by `writeExtractedFacts` (Layer B fact extraction
+ *                from task_complete.facts) and `runRemember` / `runAddFact`
+ *                / `maybeRemember` (the `context` room).
+ *   shared wing — written by `runAddFact` (qwen-tools.ts:611, fact_type ∈
+ *                {naming, decision, user_preference, context}). Note the
+ *                absence of `shared/canon_observation`: `add_fact` doesn't
+ *                accept that fact_type, and `writeExtractedFacts` writes
+ *                canon_observation only to the `qwen` wing. If a future
+ *                writer for shared/canon_observation lands, add the tuple
+ *                here.
+ *
+ * MemPalace's search endpoint accepts a single (wing, room), so we fan
+ * out one search per tuple and merge by similarity. Currently 9 searches.
  */
-const TOPICAL_DECISIONS_WINGS = ["qwen", "shared"] as const;
+const TOPICAL_DECISIONS_FANOUT: ReadonlyArray<{ wing: string; room: string }> =
+  [
+    { wing: "qwen", room: "decision" },
+    { wing: "qwen", room: "naming" },
+    { wing: "qwen", room: "user_preference" },
+    { wing: "qwen", room: "canon_observation" },
+    { wing: "qwen", room: "context" },
+    { wing: "shared", room: "decision" },
+    { wing: "shared", room: "naming" },
+    { wing: "shared", room: "user_preference" },
+    { wing: "shared", room: "context" },
+  ] as const;
 
 /**
- * Rooms searched for topical durable decisions. Covers the Layer-B fact
- * taxonomy in CONTEXT.md (decision / naming / user_preference /
- * canon_observation) plus `context` — `runRemember`, `runAddFact`, and the
- * auto-summary writer (qwen-harness.ts:maybeRemember) write `room: "context"`,
- * so excluding it would leave that data unreachable from the system prompt.
- * MemPalace's search endpoint accepts a single `room`, so we fan out one
- * search per (wing, room) and merge by similarity.
- */
-const TOPICAL_DECISIONS_ROOMS = [
-  "decision",
-  "naming",
-  "user_preference",
-  "canon_observation",
-  "context",
-] as const;
-
-/**
- * Per-(wing,room) limit for the fan-out search. With
- * `TOPICAL_DECISIONS_WINGS.length` × `TOPICAL_DECISIONS_ROOMS.length`
- * searches at this limit each, the merged candidate pool is at most
- * `wings × rooms × limit` entries (currently 2 × 5 × 3 = 30) — downstream
- * block rendering trims to TOPICAL_DECISIONS_BUDGET. The comment uses the
- * symbolic forms so future room/wing additions don't doc-rot the maths.
+ * Per-tuple limit for the fan-out search. With `TOPICAL_DECISIONS_FANOUT`
+ * tuples at this limit each, the merged candidate pool is at most
+ * `fanout × limit` entries (currently 9 × 3 = 27) — downstream block
+ * rendering trims to TOPICAL_DECISIONS_BUDGET. Symbolic count so future
+ * tuple additions don't doc-rot the maths.
  */
 const TOPICAL_DECISIONS_PER_ROOM_LIMIT = 3;
 
 /**
- * Run the topical-decisions fan-out. Issues N searches in parallel (one per
- * wing × room), merges their results, deduplicates by text, sorts by
- * descending similarity, and returns the de-duped list as **plain text
- * strings** suitable for the `[RELEVANT DECISIONS]` block. Similarity
- * scores drive sort + dedupe order then are discarded — the block format
- * has no slot for them. Returns [] when MemPalace is disabled or every
- * search fails.
+ * Run the topical-decisions fan-out. Issues one search per tuple in
+ * `TOPICAL_DECISIONS_FANOUT` in parallel, merges their results,
+ * deduplicates by text, sorts by descending similarity, and returns the
+ * de-duped list as **plain text strings** suitable for the
+ * `[RELEVANT DECISIONS]` block. Similarity scores drive sort + dedupe
+ * order then are discarded — the block format has no slot for them.
+ * Returns [] when MemPalace is disabled or every search fails.
  */
 async function searchTopicalDecisions(query: string): Promise<string[]> {
   if (!query.trim()) return [];
-  const tasks: Array<Promise<SearchResult[]>> = [];
-  for (const wing of TOPICAL_DECISIONS_WINGS) {
-    for (const room of TOPICAL_DECISIONS_ROOMS) {
-      tasks.push(
-        mpSearch(query, {
-          wing,
-          room,
-          limit: TOPICAL_DECISIONS_PER_ROOM_LIMIT,
-        }),
-      );
-    }
-  }
+  const tasks: Array<Promise<SearchResult[]>> = TOPICAL_DECISIONS_FANOUT.map(
+    ({ wing, room }) =>
+      mpSearch(query, {
+        wing,
+        room,
+        limit: TOPICAL_DECISIONS_PER_ROOM_LIMIT,
+      }),
+  );
   // Promise.allSettled (not all) so a single rejecting search doesn't drop
-  // results from the other (wings × rooms − 1). mpSearch currently catches
-  // its own errors and returns []; allSettled is defence-in-depth for
-  // future changes.
+  // results from the other (fanout − 1). mpSearch currently catches its
+  // own errors and returns []; allSettled is defence-in-depth for future
+  // changes.
   const settled = await Promise.allSettled(tasks);
   const merged: SearchResult[] = [];
   for (const r of settled) {
@@ -1605,9 +1613,12 @@ export async function runQwenTurn(
 
         // Gather context: persona + dual-wing topical recall + Layer C state.
         // Budget allocation comes from ADR-0003 sub-budgets:
-        //   topical decisions   → mpSearch over {qwen, shared} wings,
-        //                          {decision, naming, user_preference,
-        //                          canon_observation} rooms → decisions block
+        //   topical decisions   → mpSearch over the (wing, room) tuples in
+        //                          TOPICAL_DECISIONS_FANOUT (qwen wing has
+        //                          all five Layer-B-fact rooms incl.
+        //                          canon_observation + context; shared wing
+        //                          has the four rooms `add_fact` actually
+        //                          writes to) → decisions block
         //   topical prose       → searchProse(channelId) over conversation
         //                          wing → prose block
         //   channel state       → loadChannelState (truncated below)
