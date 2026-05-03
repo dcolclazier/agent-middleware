@@ -18,6 +18,7 @@ import {
   readVerbatimWindow,
   searchProse,
   transcribeIncoming,
+  awaitPendingWrites,
   CHANNEL_TRANSCRIPT_CAP,
   CHANNEL_TRANSCRIPT_WING,
   MEMORY_OFFLINE_WARNING,
@@ -1463,6 +1464,71 @@ async function main() {
 
     setMemoryOfflineNotifier(null);
     _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // ---- awaitPendingWrites barrier semantics (issue #6 / iter-1 race fix) ----
+  // The verbatim-window read in runQwenTurn awaits pending writes for a
+  // channel before reading, so the inbound message that triggered the turn
+  // (fired-and-forgot via `void transcribeIncoming(...)` in bot-instance.ts)
+  // is guaranteed visible. Pin two contracts:
+  //   (a) await on a never-touched channel resolves immediately
+  //   (b) under a slow backend, await drains pending writes — the post-await
+  //       read sees writes that were fired-and-forgot before the await
+  sect("12a. awaitPendingWrites — fresh channel resolves immediately");
+  {
+    let resolved = false;
+    void awaitPendingWrites("never-touched-channel").then(() => {
+      resolved = true;
+    });
+    // Yield once so the no-op promise can settle. Without queued writes the
+    // resolver is `Promise.resolve()` so a single microtask flush suffices.
+    await new Promise((r) => setImmediate(r));
+    check("await on never-touched channel resolves on next tick", resolved);
+  }
+
+  sect("12b. awaitPendingWrites — drains slow fire-and-forget writes");
+  {
+    const channel = "race-test-channel";
+    // Slow backend: addDrawer resolves after a 50ms delay so the writes
+    // can't have completed synchronously by the time we issue the read.
+    const baseBackend = makeBackend();
+    const slowBackend: TranscriptBackend = {
+      ...baseBackend,
+      addDrawer: async (wing, room, content) => {
+        await new Promise((r) => setTimeout(r, 50));
+        return baseBackend.addDrawer(wing, room, content);
+      },
+    };
+    _setBackendForTesting(slowBackend);
+    // Fire-and-forget three writes (mirroring bot-instance.ts:1364's
+    // `void transcribeIncoming(...)` pattern).
+    void writeTurn(channel, "Alice", "msg-1", "2027-02-01T00:00:00Z");
+    void writeTurn(channel, "Bob", "msg-2", "2027-02-01T00:00:01Z");
+    void writeTurn(channel, "Carol", "msg-3", "2027-02-01T00:00:02Z");
+    // Sanity: the writes are still in flight (slow backend hasn't replied
+    // yet), so a list right now should NOT have all three drawers landed.
+    const before = baseBackend.drawers.length;
+    check(
+      "before await: not all three writes have landed under slow backend",
+      before < 3,
+      `got ${before}`,
+    );
+    // The barrier — wait for the channel's serial write chain to drain.
+    await awaitPendingWrites(channel);
+    // After the barrier, all three writes must be visible.
+    check(
+      "after await: all three drawers visible in backend",
+      baseBackend.drawers.length === 3,
+      `got ${baseBackend.drawers.length}`,
+    );
+    // And readVerbatimWindow returns them too (the user-facing contract).
+    const window = await readVerbatimWindow(channel, "self-not-present", 10);
+    check(
+      "after await: readVerbatimWindow returns all three entries",
+      window.length === 3,
+      `got ${window.length}`,
+    );
     _resetBackendForTesting();
   }
 
