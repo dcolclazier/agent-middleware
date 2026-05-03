@@ -1426,8 +1426,9 @@ async function searchTopicalDecisions(query: string): Promise<string[]> {
     }
   }
   // Promise.allSettled (not all) so a single rejecting search doesn't drop
-  // results from the other 7. mpSearch currently catches its own errors and
-  // returns []; allSettled is defence-in-depth for future changes.
+  // results from the other (wings × rooms − 1). mpSearch currently catches
+  // its own errors and returns []; allSettled is defence-in-depth for
+  // future changes.
   const settled = await Promise.allSettled(tasks);
   const merged: SearchResult[] = [];
   for (const r of settled) {
