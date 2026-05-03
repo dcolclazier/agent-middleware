@@ -408,6 +408,52 @@ async function main() {
     );
   }
 
+  // 7b. Mention tokens inside entry.text are stripped to semantic placeholders
+  // so the LLM cannot learn to echo a real `<@123>`/`<@&123>` ping back to
+  // Discord. Mirrors the rewrite in bot-instance.ts:830-847 which the live
+  // history fetch path applies; transcribeIncoming stores raw message.content.
+  sect("7b. mention tokens → [@user] / [@role] placeholders");
+  {
+    const entries: TranscriptEntry[] = [
+      makeEntry(
+        "ch",
+        "Alice",
+        "ping <@123456789> and the role <@&987654321>",
+        "2026-04-30T12:00:00Z",
+      ),
+      makeEntry(
+        "ch",
+        "Bob",
+        "legacy nick form <@!111222333>",
+        "2026-04-30T12:00:01Z",
+      ),
+    ];
+    const prompt = buildSystemPrompt({
+      persona: fakePersona,
+      decisions: [],
+      prose: entries, // both renderers share the helper — cover prose too
+      channelState: "",
+      tools: noTools,
+      verbatimWindow: entries,
+    });
+    check(
+      "no raw <@digits> token survives anywhere in the rendered prompt",
+      !/<@!?\d+>/.test(prompt),
+    );
+    check(
+      "no raw <@&digits> role token survives in the rendered prompt",
+      !/<@&\d+>/.test(prompt),
+    );
+    check(
+      "user-mention placeholder is rendered",
+      prompt.includes("[@user]"),
+    );
+    check(
+      "role-mention placeholder is rendered",
+      prompt.includes("[@role]"),
+    );
+  }
+
   // 7. INSTRUCTIONS block reflects the new verbatim-recall capability.
   sect("7. INSTRUCTIONS mentions [CHANNEL CONVERSATION]");
   {

@@ -773,22 +773,39 @@ function applyRollingWindow(session: QwenSession): void {
 }
 
 /**
+ * Flatten newlines and strip raw Discord mention tokens from transcript text
+ * before it lands in a system-prompt block.
+ *
+ * Newline collapse: each drawer renders on its own line — the brief's
+ * format contract is one entry per line.
+ *
+ * Mention scrub: `transcribeIncoming` writes `message.content` raw, so live
+ * `<@123>` / `<@!123>` / `<@&123>` tokens reach the prompt. Mirroring the
+ * pattern at `bot-instance.ts:830-847`, we rewrite them to semantic
+ * placeholders (`[@user]` / `[@role]`) — without discord.js mention
+ * collections we cannot resolve to usernames here, but the pings are what
+ * matter (a downstream LLM that learns to echo `<@123>` back to Discord
+ * actually pings; `[@user]` does not).
+ */
+function sanitizeTranscriptText(text: string): string {
+  return text
+    .replace(/\r?\n/g, " ")
+    .replace(/<@!?\d+>/g, "[@user]")
+    .replace(/<@&\d+>/g, "[@role]");
+}
+
+/**
  * Render a `[CHANNEL CONVERSATION]` block from a verbatim window of transcript
  * entries (oldest-to-newest). If the rendered block exceeds
  * VERBATIM_WINDOW_BUDGET tokens, oldest entries are dropped first until it
  * fits. Returns the empty string when the window is empty or every entry
  * would have been trimmed away — callers omit the block in that case.
- *
- * Newlines inside `entry.text` (Discord messages can contain them) are
- * collapsed to spaces so each drawer renders on its own line; the brief's
- * format contract is one entry per line.
  */
 function renderVerbatimWindowBlock(entries: TranscriptEntry[]): string {
   if (entries.length === 0) return "";
-  const lines = entries.map((e) => {
-    const flatText = e.text.replace(/\r?\n/g, " ");
-    return `${e.timestamp} ${e.author}: ${flatText}`;
-  });
+  const lines = entries.map(
+    (e) => `${e.timestamp} ${e.author}: ${sanitizeTranscriptText(e.text)}`,
+  );
   let i = 0;
   while (i < lines.length) {
     const candidate = `[CHANNEL CONVERSATION]\n${lines.slice(i).join("\n")}`;
@@ -829,15 +846,14 @@ function renderDecisionsBlock(decisions: string[]): string {
  * Render a `[RELEVANT PROSE]` block from transcript entries, trimmed to
  * TOPICAL_PROSE_BUDGET tokens. Same oldest-first drop policy as
  * decisions; assumes callers pass entries in the order they want preserved
- * (search-relevance / score order). Newlines inside `entry.text` are
- * collapsed so each entry fits on one line, mirroring the verbatim window.
+ * (search-relevance / score order). Same newline-flatten + mention-scrub
+ * sanitisation as the verbatim window — see `sanitizeTranscriptText`.
  */
 function renderProseBlock(entries: TranscriptEntry[]): string {
   if (entries.length === 0) return "";
-  const lines = entries.map((e) => {
-    const flatText = e.text.replace(/\r?\n/g, " ");
-    return `${e.timestamp} ${e.author}: ${flatText}`;
-  });
+  const lines = entries.map(
+    (e) => `${e.timestamp} ${e.author}: ${sanitizeTranscriptText(e.text)}`,
+  );
   let n = lines.length;
   while (n > 0) {
     const candidate = `[RELEVANT PROSE]\n${lines.slice(0, n).join("\n")}`;
