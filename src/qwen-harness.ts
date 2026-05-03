@@ -1361,9 +1361,12 @@ const TOPICAL_DECISIONS_ROOMS = [
 ] as const;
 
 /**
- * Per-(wing,room) limit for the fan-out search. With 2 wings × 4 rooms = 8
- * searches at limit 3 each, the merged candidate pool is up to 24 entries —
- * downstream block rendering trims to TOPICAL_DECISIONS_BUDGET.
+ * Per-(wing,room) limit for the fan-out search. With
+ * `TOPICAL_DECISIONS_WINGS.length` × `TOPICAL_DECISIONS_ROOMS.length`
+ * searches at this limit each, the merged candidate pool is at most
+ * `wings × rooms × limit` entries (currently 2 × 5 × 3 = 30) — downstream
+ * block rendering trims to TOPICAL_DECISIONS_BUDGET. The comment uses the
+ * symbolic forms so future room/wing additions don't doc-rot the maths.
  */
 const TOPICAL_DECISIONS_PER_ROOM_LIMIT = 3;
 
