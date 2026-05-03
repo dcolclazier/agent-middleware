@@ -327,6 +327,77 @@ async function main() {
     _resetBackendForTesting();
   }
 
+  // 4b. Integration — k=10 truncation actually fires after self-exclusion.
+  // Test 4's fixture only contains 8 non-self entries (out of 12 total),
+  // so it never exercises the slice-after-filter logic that's supposed to
+  // bound the result at K. A bug in filter-before-slice ordering — e.g.
+  // taking the last 10 raw, then filtering, leaving fewer than 10 — would
+  // pass test 4 silently. This fixture forces the truncation by giving 14
+  // non-self entries among 18 total, expecting exactly the 10 newest
+  // non-self entries in the result.
+  sect("4b. integration — 14 non-self entries, K=10 forces truncation");
+  {
+    const channel = "ch-truncate";
+    const selfAuthor = "Qwen";
+    const backend = makeBackend();
+    _setBackendForTesting(backend);
+
+    // 18 entries: 14 non-Qwen (Alice/Bob alternating) interleaved with
+    // 4 Qwen entries. Indices: 0-3 Alice, 4 Qwen, 5-8 Bob, 9 Qwen, 10-13
+    // Alice, 14 Qwen, 15-17 Bob, plus a final Qwen at 18 to test that
+    // a self-authored newest message also doesn't slip through.
+    const authors = [
+      "Alice", "Alice", "Alice", "Alice", "Qwen",
+      "Bob", "Bob", "Bob", "Bob", "Qwen",
+      "Alice", "Alice", "Alice", "Alice", "Qwen",
+      "Bob", "Bob", "Bob",
+      "Qwen",
+    ];
+    for (let i = 0; i < authors.length; i++) {
+      await writeTurn(
+        channel,
+        authors[i]!,
+        `m${i}-${authors[i]}`,
+        new Date(Date.UTC(2026, 1, 1, 0, 0, i)).toISOString(),
+      );
+    }
+
+    const window = await readVerbatimWindow(channel, selfAuthor, 10);
+    check(
+      "result is exactly K=10 entries (truncation fired)",
+      window.length === 10,
+      `got ${window.length}`,
+    );
+    check(
+      "no self-authored (Qwen) entries leaked through",
+      window.every((e) => e.author !== selfAuthor),
+    );
+    // 14 non-self total → expected newest 10 non-self entries are at
+    // original indices: 5,6,7,8,10,11,12,13,15,16,17. Wait — that's 11.
+    // Let me recount: non-Qwen indices are
+    // 0,1,2,3 (Alice) + 5,6,7,8 (Bob) + 10,11,12,13 (Alice) + 15,16,17 (Bob)
+    // = 4 + 4 + 4 + 3 = 15. Hmm, recompute: actually positions 0-3 = 4,
+    // 5-8 = 4, 10-13 = 4, 15-17 = 3 ⇒ 15 non-self entries among 19 total.
+    // The newest 10 non-self entries are the LAST 10 of those 15:
+    // skipping the first 5 non-self (0,1,2,3,5) — i.e. indices
+    // 6,7,8,10,11,12,13,15,16,17.
+    const expectedNewest10 = [6, 7, 8, 10, 11, 12, 13, 15, 16, 17];
+    for (const i of expectedNewest10) {
+      check(
+        `newest-10 entry m${i}-${authors[i]} is in the window`,
+        window.some((e) => e.text === `m${i}-${authors[i]}`),
+      );
+    }
+    // Oldest entries beyond the K=10 newest must be excluded.
+    for (const i of [0, 1, 2, 3, 5]) {
+      check(
+        `pre-truncation entry m${i}-${authors[i]} is NOT in the window`,
+        !window.some((e) => e.text === `m${i}-${authors[i]}`),
+      );
+    }
+    _resetBackendForTesting();
+  }
+
   // 5. Fresh channel — readVerbatimWindow returns empty → block omitted.
   sect("5. fresh channel — empty window → block omitted");
   {
