@@ -164,14 +164,19 @@ export interface QwenSession {
   hadCommitDuringThisTask: boolean;
   lastUserMessageRequestedCanon: boolean;
   /**
-   * Append-only log of the human-typed user messages that drove this
-   * session, in arrival order. Distinct from `messages` because the harness
+   * Rolling tail of the human-typed user messages that drove this session,
+   * newest at the end, capped at HUMAN_USER_MESSAGES_CAP entries
+   * (drop-oldest-on-write). Distinct from `messages` because the harness
    * also appends synthetic `role: "user"` entries for steering (e.g. the
    * text-only-gate canon-commit pushback at runQwenTurn). Topical-recall
    * query construction (`buildLastUserMessagesQuery`) reads from this so
    * mid-loop middleware nudges don't skew retrieval. Optional for
    * backward-compat with sessions persisted before this field existed —
    * the helper falls back to scanning `messages` when absent.
+   *
+   * Bounded so long-lived sessions can't grow this array indefinitely;
+   * `applyRollingWindow` prunes `messages` but doesn't touch this field,
+   * and only the last few entries are ever read (n ≤ 3 in practice).
    */
   humanUserMessages?: string[];
   /**
@@ -1337,6 +1342,15 @@ export function validateWireBudget(
 const VERBATIM_WINDOW_K = 10;
 
 /**
+ * Cap on `session.humanUserMessages`. `buildLastUserMessagesQuery` only ever
+ * reads the trailing `n ≤ 3` entries; the cap is comfortably above that so
+ * a long-lived session can't grow this field unboundedly across hundreds
+ * of turns (each entry can be up to TURN_BUDGET ≈ 22k tokens; without a
+ * cap, persisted JSON grows indefinitely).
+ */
+const HUMAN_USER_MESSAGES_CAP = 50;
+
+/**
  * Wings searched for topical durable decisions. Issue #7: decisions and
  * naming live in `qwen` (per-agent fact extraction); user preferences and
  * canon observations may also be filed under `shared` for cross-agent reach.
@@ -1447,6 +1461,15 @@ export async function runQwenTurn(
     // initialise for sessions persisted before this field existed.
     if (!session.humanUserMessages) session.humanUserMessages = [];
     session.humanUserMessages.push(userMessage);
+    // Drop-oldest-on-write so this array can't grow indefinitely on
+    // long-lived sessions. Mirrors ADR-0004's drop-oldest pattern for the
+    // channel transcript wing.
+    if (session.humanUserMessages.length > HUMAN_USER_MESSAGES_CAP) {
+      session.humanUserMessages.splice(
+        0,
+        session.humanUserMessages.length - HUMAN_USER_MESSAGES_CAP,
+      );
+    }
     session.currentTurn = 0;
     session.toolFailures = {};
     session.hadCommitDuringThisTask = false;
