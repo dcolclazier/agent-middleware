@@ -227,6 +227,72 @@ async function main() {
     );
   }
 
+  // 1d. Production sequence — first post-upgrade turn for a legacy session
+  // must NOT duplicate the new user message in humanUserMessages.
+  // runQwenTurn's iter-3 backfill bug (Copilot iter-5): if the new
+  // userMessage is pushed to session.messages BEFORE backfill runs, the
+  // backfill scan picks it up, then the explicit push to humanUserMessages
+  // duplicates it — and the older context turns the backfill exists to
+  // preserve get pushed past the n=3 read window. The fix is to backfill
+  // FIRST, then push. This test pins the production order.
+  sect(
+    "1d. production sequence — first post-upgrade turn doesn't duplicate userMessage",
+  );
+  {
+    const legacy: QwenSession = {
+      id: "legacy-prod-seq",
+      channelId: "x",
+      messages: [
+        { role: "user", content: "earlier context one" },
+        { role: "assistant", content: "ack" },
+        { role: "user", content: "earlier context two" },
+        { role: "assistant", content: "ack" },
+      ],
+      taskState: "idle",
+      currentTurn: 0,
+      toolFailures: {},
+      hadCommitDuringThisTask: false,
+      lastUserMessageRequestedCanon: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    // Mirror runQwenTurn's order EXACTLY: backfill first, then push to
+    // both arrays.
+    const newUserMessage = "ok";
+    backfillHumanUserMessagesIfNeeded(legacy);
+    legacy.messages.push({ role: "user", content: newUserMessage });
+    legacy.humanUserMessages!.push(newUserMessage);
+
+    check(
+      "humanUserMessages has exactly 3 entries (2 prior + 1 new), no duplicate",
+      legacy.humanUserMessages?.length === 3,
+      `got length=${legacy.humanUserMessages?.length}: ${JSON.stringify(legacy.humanUserMessages)}`,
+    );
+    check(
+      "newUserMessage 'ok' appears exactly once in humanUserMessages",
+      legacy.humanUserMessages?.filter((m) => m === newUserMessage).length ===
+        1,
+      `got: ${JSON.stringify(legacy.humanUserMessages)}`,
+    );
+    const q = buildLastUserMessagesQuery(legacy, 3);
+    check(
+      "topical query buffers 'ok' against BOTH prior context turns (issue #7)",
+      q.includes("earlier context one") &&
+        q.includes("earlier context two") &&
+        q.endsWith("ok"),
+      `got: ${JSON.stringify(q)}`,
+    );
+    // Direct anti-regression: if backfill ran AFTER the messages.push of
+    // the new turn, the query would have "ok" twice and lose "earlier
+    // context one" because slice(-3) would be [context two, ok, ok].
+    const lastThree = legacy.humanUserMessages!.slice(-3);
+    check(
+      "slice(-3) preserves 'earlier context one' (would be lost on duplication bug)",
+      lastThree.includes("earlier context one"),
+      `slice(-3): ${JSON.stringify(lastThree)}`,
+    );
+  }
+
   // 2. Fewer-than-n user messages — return whatever exists, joined.
   sect("2. fewer-than-n — joins what exists");
   {

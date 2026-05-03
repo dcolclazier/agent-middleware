@@ -1585,20 +1585,27 @@ export async function runQwenTurn(
       session = createSession(channelId);
     }
 
-    // Fresh user message: reset per-message counters.
-    session.messages.push({ role: "user", content: userMessage });
+    // ORDER MATTERS — backfill MUST run before either array sees the new
+    // userMessage. backfill scans session.messages for prior `role:"user"`
+    // entries; if we'd pushed userMessage into session.messages first, the
+    // backfill would copy it into humanUserMessages, then the explicit
+    // push below would duplicate it — leaving the latest message twice in
+    // humanUserMessages and dropping one of the older context turns the
+    // backfill exists to preserve. (Caught by Copilot iter-5 against the
+    // iter-3 backfill commit.)
+    //
     // Track real human input separately from synthetic harness pushbacks
     // (text-only-gate canon-commit nudge etc., which also push role:"user").
     // `buildLastUserMessagesQuery` reads this for topical retrieval so
-    // mid-loop middleware nudges don't skew the recall query. Lazily
-    // initialise for sessions persisted before this field existed.
+    // mid-loop middleware nudges don't skew the recall query.
     backfillHumanUserMessagesIfNeeded(session);
+    session.messages.push({ role: "user", content: userMessage });
     session.humanUserMessages!.push(userMessage);
     // Drop-oldest-on-write so this array can't grow indefinitely on
     // long-lived sessions. Mirrors ADR-0004's drop-oldest pattern for the
-    // channel transcript wing. Applied AFTER the backfill so a chatty
-    // legacy session with hundreds of historical user turns gets bounded
-    // to the cap before any of those entries are read.
+    // channel transcript wing. Applied AFTER the backfill+push so a
+    // chatty legacy session with hundreds of historical user turns gets
+    // bounded to the cap before any of those entries are read.
     if (session.humanUserMessages!.length > HUMAN_USER_MESSAGES_CAP) {
       session.humanUserMessages!.splice(
         0,
