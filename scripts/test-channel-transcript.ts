@@ -20,9 +20,12 @@ import {
   transcribeIncoming,
   CHANNEL_TRANSCRIPT_CAP,
   CHANNEL_TRANSCRIPT_WING,
+  MEMORY_OFFLINE_WARNING,
   _setBackendForTesting,
   _resetBackendForTesting,
   _resetSeenIncomingForTesting,
+  _resetMemoryOfflineStateForTesting,
+  setMemoryOfflineNotifier,
   type TranscriptBackend,
   type TranscriptEntry,
 } from "../src/channel-transcript.js";
@@ -914,6 +917,553 @@ async function main() {
     );
     _resetBackendForTesting();
     _resetSeenIncomingForTesting();
+  }
+
+  // 20. Memory-offline warning: failed mpAddDrawer (writeTurn) on a watched
+  // channel posts the warning ONCE. Subsequent failures while still offline
+  // do not re-fire. After a successful call, the flag clears so a fresh
+  // outage re-fires the warning.
+  sect("20. memory-offline warning — fires once per outage on writeTurn failure");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    let mode: "fail" | "ok" = "fail";
+    const flippy: TranscriptBackend = {
+      async addDrawer() {
+        if (mode === "fail") return { success: false, error: "boom" };
+        return { success: true, drawer_id: "ok-1" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        if (mode === "fail") {
+          throw new Error("network unreachable");
+        }
+        return [];
+      },
+    };
+    _setBackendForTesting(flippy);
+
+    // First failure → notification fires.
+    await writeTurn(channel, "A", "first", "2026-10-01T00:00:00Z");
+    check(
+      "first failure posted exactly one notification",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    check(
+      "notification carries the canonical warning text",
+      notifications[0]?.message === MEMORY_OFFLINE_WARNING,
+      `actual=${notifications[0]?.message ?? "<none>"}`,
+    );
+    check(
+      "notification is scoped to the failing channel",
+      notifications[0]?.channelId === channel,
+    );
+
+    // Second failure → flag is set, no second notification.
+    await writeTurn(channel, "A", "second", "2026-10-01T00:00:01Z");
+    check(
+      "second failure does NOT post a duplicate notification",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+
+    // Recovery → flag clears.
+    mode = "ok";
+    await writeTurn(channel, "A", "recovered", "2026-10-01T00:00:02Z");
+    check(
+      "successful call did not post a notification",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+
+    // Fresh outage → notification re-fires.
+    mode = "fail";
+    await writeTurn(channel, "A", "outage 2", "2026-10-01T00:00:03Z");
+    check(
+      "subsequent outage re-fires the notification once",
+      notifications.length === 2,
+      `actual=${notifications.length}`,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 21. Memory-offline warning — searchProse failure on a channel-scoped call
+  // also fires the warning. Empty success (no results, but call succeeded)
+  // does NOT fire.
+  sect("21. memory-offline warning — searchProse: failure fires, empty success silent");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    // Empty-success case first: backend returns [] without throwing — no warning.
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: true, drawer_id: "x" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    const empty = await searchProse("nothing matches", channel);
+    check(
+      "empty-success search returned []",
+      Array.isArray(empty) && empty.length === 0,
+    );
+    check(
+      "empty-success search did NOT fire warning",
+      notifications.length === 0,
+      `actual=${notifications.length}`,
+    );
+
+    // Failure case: backend throws — warning fires once.
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: true, drawer_id: "x" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        throw new Error("connect ECONNREFUSED");
+      },
+    });
+    const failed = await searchProse("anything", channel);
+    check(
+      "failed search returned []",
+      Array.isArray(failed) && failed.length === 0,
+    );
+    check(
+      "failed search fired warning once",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    check(
+      "warning message matches canonical text",
+      notifications[0]?.message === MEMORY_OFFLINE_WARNING,
+    );
+
+    // Repeated failure on the same channel — still suppressed.
+    await searchProse("again", channel);
+    check(
+      "repeated failure on same channel suppressed",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 22. Memory-offline warning — per-channel scoping. Channel A's outage does
+  // not suppress channel B's first-failure warning.
+  sect("22. memory-offline warning — per-channel scope");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        throw new Error("down");
+      },
+    });
+    await writeTurn(channel, "A", "msg-A", "2026-11-01T00:00:00Z");
+    await writeTurn(otherChannel, "B", "msg-B", "2026-11-01T00:00:01Z");
+    check(
+      "two distinct channels produced two notifications",
+      notifications.length === 2,
+      `actual=${notifications.length}`,
+    );
+    const seenChannels = new Set(notifications.map((n) => n.channelId));
+    check(
+      "notifications are per-channel",
+      seenChannels.has(channel) && seenChannels.has(otherChannel),
+    );
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 23. Memory-offline warning — notifier callback errors do not break the
+  // bot's reply path (writeTurn must still resolve). Defensive coding for
+  // the Discord poster failing.
+  sect("23. memory-offline warning — notifier errors swallowed");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    setMemoryOfflineNotifier(() => {
+      throw new Error("notifier blew up");
+    });
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    let threw = false;
+    try {
+      await writeTurn(channel, "A", "x", "2026-12-01T00:00:00Z");
+    } catch {
+      threw = true;
+    }
+    check("writeTurn does not throw when notifier throws", !threw);
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 24. Memory-offline warning — backend that throws connection-style errors
+  // simulates the outage path (the real-client + unreachable-URL scenario is
+  // exercised in scripts/test-mempalace-warning.ts which spawns a fresh tsx
+  // process with MEMPALACE_URL set to a black-hole address before module
+  // load — the URL must be captured at import time, so it can't be flipped
+  // mid-run inside this script).
+  sect("24. memory-offline warning — connection-style throw simulates outage");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+
+    // Backend that throws the same shape mempalace-client throws when the
+    // URL is unreachable: AbortError or fetch failed, surfaced through
+    // mpSearchResult's tagged variant.
+    let outage = true;
+    _setBackendForTesting({
+      async addDrawer() {
+        if (outage) {
+          throw new Error("fetch failed: connect ECONNREFUSED 127.0.0.1:1");
+        }
+        return { success: true, drawer_id: "ok" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        if (outage) {
+          throw new Error("fetch failed: connect ECONNREFUSED 127.0.0.1:1");
+        }
+        return [];
+      },
+    });
+
+    const outageChannel = "outage-channel";
+    await writeTurn(outageChannel, "A", "first", "2027-01-01T00:00:00Z");
+    check(
+      "outage: first failure posts warning",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    await writeTurn(outageChannel, "A", "second", "2027-01-01T00:00:01Z");
+    check(
+      "outage: second failure suppressed",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    // Recovery: clear flag, no warning on success.
+    outage = false;
+    await writeTurn(outageChannel, "A", "recovered", "2027-01-01T00:00:02Z");
+    check(
+      "recovery: success does not post a notification",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    // Fresh outage: re-fires once.
+    outage = true;
+    await writeTurn(outageChannel, "A", "outage 2", "2027-01-01T00:00:03Z");
+    check(
+      "fresh outage re-fires the warning once",
+      notifications.length === 2,
+      `actual=${notifications.length}`,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 25. Memory-offline warning — global searchProse (no channelId) does NOT
+  // touch the per-channel offline state. There's no channel to attribute the
+  // failure to, and global searches shouldn't accidentally clear another
+  // channel's outage flag.
+  sect("25. memory-offline warning — searchProse without channelId is silent");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: true, drawer_id: "x" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        throw new Error("global search down");
+      },
+    });
+    // Failed search WITHOUT channelId — should NOT fire warning.
+    const r = await searchProse("anything"); // no channelId
+    check("global search returned []", Array.isArray(r) && r.length === 0);
+    check(
+      "global search failure did NOT fire warning",
+      notifications.length === 0,
+      `actual=${notifications.length}`,
+    );
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 26. Memory-offline warning — setMemoryOfflineNotifier(null) clears the
+  // notifier; subsequent failures log but do not invoke any callback.
+  sect("26. memory-offline warning — setMemoryOfflineNotifier(null) disables");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    let invoked = 0;
+    setMemoryOfflineNotifier(() => {
+      invoked++;
+    });
+    setMemoryOfflineNotifier(null);
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    await writeTurn(channel, "A", "x", "2026-12-15T00:00:00Z");
+    check(
+      "after setMemoryOfflineNotifier(null), prior callback not invoked",
+      invoked === 0,
+      `invoked=${invoked}`,
+    );
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 27. Memory-offline warning — failure-while-notifier-null does NOT
+  // permanently suppress later warnings once a notifier is wired. Regression
+  // test for the case where writeTurn runs (e.g. an HTTP route hits
+  // channel-transcript before Discord wiring sets the notifier): the channel
+  // must remain eligible for the first postable warning.
+  sect("27. memory-offline warning — null-notifier failure does not poison flag");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    setMemoryOfflineNotifier(null);
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+    // Failure occurs while no notifier is wired.
+    await writeTurn(channel, "A", "pre-wiring", "2026-12-20T00:00:00Z");
+
+    // Now the bot wiring lands — notifier is set.
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+
+    // Next failure on the same channel should fire the warning once.
+    await writeTurn(channel, "A", "post-wiring", "2026-12-20T00:00:01Z");
+    check(
+      "post-wiring failure fires warning despite earlier null-notifier failure",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+    check(
+      "warning is scoped to the channel that just failed",
+      notifications[0]?.channelId === channel,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
+  }
+
+  // 28. Memory-offline warning — notifier-throws does NOT poison the flag.
+  // Regression: if the notifier throws synchronously or its returned promise
+  // rejects (Discord outage / missing permissions), no notice was posted,
+  // so the next MemPalace failure on that channel must retry posting rather
+  // than be silenced by a flag set in advance.
+  sect("28. memory-offline warning — notifier-throws does not poison flag");
+  {
+    process.env.MEMPALACE_ENABLED = "true";
+    _resetMemoryOfflineStateForTesting();
+    _setBackendForTesting({
+      async addDrawer() {
+        return { success: false, error: "down" };
+      },
+      async listDrawers() {
+        return [];
+      },
+      async getDrawer() {
+        return null;
+      },
+      async deleteDrawer() {
+        return true;
+      },
+      async search() {
+        return [];
+      },
+    });
+
+    // Phase 1: synchronous throw. Notifier raises; no notice posted.
+    let invoked = 0;
+    setMemoryOfflineNotifier(() => {
+      invoked++;
+      throw new Error("discord down");
+    });
+    await writeTurn(channel, "A", "first", "2027-01-01T00:00:00Z");
+    check(
+      "throwing notifier was invoked on first failure",
+      invoked === 1,
+      `invoked=${invoked}`,
+    );
+
+    // Phase 2: subsequent failure on same channel — notifier must run again,
+    // because the previous attempt rolled back the flag.
+    await writeTurn(channel, "A", "second", "2027-01-01T00:00:01Z");
+    check(
+      "throwing notifier is invoked again after a prior throw",
+      invoked === 2,
+      `invoked=${invoked}`,
+    );
+
+    // Phase 3: switch to a healthy notifier; next failure must fire warning.
+    const notifications: { channelId: string; message: string }[] = [];
+    setMemoryOfflineNotifier((channelId, message) => {
+      notifications.push({ channelId, message });
+    });
+    await writeTurn(channel, "A", "third", "2027-01-01T00:00:02Z");
+    check(
+      "healthy notifier fires after prior throws unblocked the channel",
+      notifications.length === 1,
+      `actual=${notifications.length}`,
+    );
+
+    // Phase 4: async rejection. Returned promise rejects → flag should clear.
+    _resetMemoryOfflineStateForTesting();
+    let asyncInvoked = 0;
+    setMemoryOfflineNotifier(async () => {
+      asyncInvoked++;
+      throw new Error("discord rejected");
+    });
+    await writeTurn(channel, "A", "async-1", "2027-01-01T00:01:00Z");
+    // Yield to let the rejected promise's catch handler clear the flag.
+    await new Promise((r) => setTimeout(r, 10));
+    await writeTurn(channel, "A", "async-2", "2027-01-01T00:01:01Z");
+    check(
+      "async-rejecting notifier retries on next failure",
+      asyncInvoked === 2,
+      `asyncInvoked=${asyncInvoked}`,
+    );
+
+    setMemoryOfflineNotifier(null);
+    _resetMemoryOfflineStateForTesting();
+    _resetBackendForTesting();
   }
 
   console.log(`\n======\n${passed} passed, ${failed} failed`);

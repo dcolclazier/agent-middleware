@@ -15,6 +15,7 @@ import {
 } from "./bot-instance.js";
 import { parseSlashCommand } from "./slash-commands.js";
 import { enqueueSideTurn } from "./side-session.js";
+import { setMemoryOfflineNotifier } from "./channel-transcript.js";
 
 // --- Shared state across all bots in this process ---
 // Each BotInstance adds its own user id to this set on ClientReady so no
@@ -241,6 +242,13 @@ export async function startDiscordBot(): Promise<void> {
     return;
   }
   await claudeBot.start(token);
+  // Issue #8: route the channel-transcript memory-offline warning through the
+  // ClaudeCode bot. ClaudeCode is the bot present in every channel that
+  // routes through the channel-transcript module, so it's the natural
+  // poster. Failures are best-effort — postSystemNotice swallows them.
+  setMemoryOfflineNotifier((channelId, message) => {
+    void claudeBot.postSystemNotice(channelId, message);
+  });
 }
 
 export function isDiscordBotReady(): boolean {

@@ -12,6 +12,7 @@ import {
 } from "./channel-transcript.js";
 
 import { estimateTokens } from "./token-estimate.js";
+import { TURN_BUDGET } from "./wire-budget.js";
 
 // --- Types ---
 
@@ -144,24 +145,6 @@ const OUTBOUND_MESSAGE_BYTE_CAP = 10_000_000;
 
 /** Max files in a single outbound message (harness contract; Discord allows up to 10). */
 const OUTBOUND_MAX_FILES_CAP = 5;
-
-// --- Oversized turn handling at the Discord routing layer ---
-//
-// Per-turn token budget enforced BEFORE the per-bot handler runs. Messages
-// over budget are either rejected (human author — ask them to chunk or attach)
-// or truncated-with-warning (bot author — keep the conversation flowing but
-// clip the body so vLLM doesn't 400). The asymmetry mirrors how
-// `parseThinkingCommand` only honours human authors.
-//
-// 22_000 from ADR-0003 (= WIRE_HARD_CAP − SYSTEM_BUDGET). src/qwen-harness.ts
-// re-derives and exports the same value under the same name. Dedupe is
-// intentionally deferred: the right fix is to lift WIRE_HARD_CAP /
-// SYSTEM_BUDGET / TURN_BUDGET into a shared constants module rather than
-// have the Discord routing layer import from a Qwen-specific module (that
-// would couple bot-instance.ts to Qwen's harness in the wrong direction).
-// Both sides agree on the value today; if ADR-0003's split changes, the
-// follow-up extraction is the place to keep them in sync.
-export const TURN_BUDGET = 22_000;
 
 /** When a bot author goes over budget, truncate to this fraction of TURN_BUDGET. */
 const TURN_TRUNCATE_FRACTION = 0.9;
@@ -793,6 +776,26 @@ export class BotInstance {
   }
 
   // --- Discord helpers ---
+
+  /**
+   * Post a short system notice (e.g. the issue #8 memory-offline warning) to
+   * a channel. Failure is non-fatal — system notices are best-effort by
+   * design. Skips transcript capture: these are infrastructure noise, not
+   * conversation, and writing them back to MemPalace during an outage would
+   * just retry the same broken connection.
+   */
+  async postSystemNotice(channelId: string, text: string): Promise<void> {
+    if (!this.client) return;
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !channel.isTextBased() || !("send" in channel)) return;
+      await channel.send(text);
+    } catch (err) {
+      console.error(
+        `[${this.displayName}] postSystemNotice failed for channel=${channelId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   async safeReact(channelId: string, messageId: string, emoji: string): Promise<void> {
     if (!this.client) return;

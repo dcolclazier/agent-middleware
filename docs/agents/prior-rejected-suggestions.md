@@ -29,3 +29,11 @@ so future-you can audit whether the rejection is still valid.
       rationale: "ADR-0003's budget table replaces the prior `[SHARED FACTS]` block with `[RELEVANT PROSE]` sourced from MemPalace's `conversation` wing. The two are different data sources (durable structured facts vs per-channel transcript history); backfilling `readFactsAsString` into the prose array would conflate them under one block name. If fallback-mode shared-facts visibility is still wanted, the right fix is a separate `[SHARED FACTS]` block restoration as a follow-up — not a prose-block backfill on this PR."
       file: src/qwen-harness.ts
       line: 1463
+
+- pr: 28
+  date: 2026-05-02
+  rejections:
+    - critique: "memoryOfflineWarned can grow without bound: once a channel has a failure and then never sees a subsequent MemPalace success, its entry is never removed. In long-lived processes that encounter many one-off channelIds during an outage, this can become an unbounded memory leak. Consider bounding this (e.g., store timestamps and periodically prune, use an LRU with a max size, or delete entries after some TTL)."
+      rationale: "Keyed by Discord channel ID, which is a stable persistent identifier — not session-scoped or ephemeral. The set's natural bound is the count of distinct Discord channels the bot ever serves (dozens), not millions of one-off keys. Per CLAUDE.md (\"Don't add features, refactor, or introduce abstractions beyond what the task requires. … Don't design for hypothetical future requirements\"), adding LRU/TTL pruning would be premature optimisation for a leak the data shape can't actually produce."
+      file: src/channel-transcript.ts
+      line: 205
