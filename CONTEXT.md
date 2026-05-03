@@ -87,6 +87,14 @@ transcript's 500-message cap — durable facts live indefinitely until
 explicitly forgotten. The retention pathway for important decisions; channel
 transcripts are scaffolding for short-term recall.
 
+A separate `room="context"` drawer is also written by the `runRemember` /
+`runAddFact` tools (qwen-tools.ts) and the `maybeRemember` auto-summary path
+(qwen-harness.ts) — a rolling unstructured scratchpad used to seed continuity
+across turns. Same infinite-retention property as the typed rooms, but not
+part of the structured Layer-B taxonomy. Topical recall must include
+`context` in its room filter to keep this data reachable from the system
+prompt.
+
 ### RAG (canon-search RAG)
 The `dcc-canon-rag` service. Currently runs on port 3001. Provides `/embed`
 (384-dim all-MiniLM-L6-v2 vectors) and `/search` (Chroma-backed semantic search
