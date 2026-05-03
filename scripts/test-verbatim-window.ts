@@ -409,10 +409,11 @@ async function main() {
   }
 
   // 7b. Mention tokens inside entry.text are stripped to semantic placeholders
-  // so the LLM cannot learn to echo a real `<@123>`/`<@&123>` ping back to
-  // Discord. Mirrors the rewrite in bot-instance.ts:830-847 which the live
-  // history fetch path applies; transcribeIncoming stores raw message.content.
-  sect("7b. mention tokens → [@user] / [@role] placeholders");
+  // so the LLM cannot learn to echo a real ping back to Discord. Covers
+  // user/role mentions (mirrors bot-instance.ts:830-847), mass-ping literals
+  // (`@everyone` / `@here` — bot send paths don't currently set
+  // `allowedMentions: { parse: [] }`), and channel links.
+  sect("7b. mention tokens → semantic placeholders");
   {
     const entries: TranscriptEntry[] = [
       makeEntry(
@@ -426,6 +427,12 @@ async function main() {
         "Bob",
         "legacy nick form <@!111222333>",
         "2026-04-30T12:00:01Z",
+      ),
+      makeEntry(
+        "ch",
+        "Mallory",
+        "@everyone please look! also @here and see <#444555666>",
+        "2026-04-30T12:00:02Z",
       ),
     ];
     const prompt = buildSystemPrompt({
@@ -445,12 +452,36 @@ async function main() {
       !/<@&\d+>/.test(prompt),
     );
     check(
+      "no raw @everyone literal survives in the rendered prompt",
+      !/(?<!\[)@everyone/.test(prompt),
+    );
+    check(
+      "no raw @here literal survives in the rendered prompt",
+      !/(?<!\[)@here/.test(prompt),
+    );
+    check(
+      "no raw <#digits> channel-link token survives in the rendered prompt",
+      !/<#\d+>/.test(prompt),
+    );
+    check(
       "user-mention placeholder is rendered",
       prompt.includes("[@user]"),
     );
     check(
       "role-mention placeholder is rendered",
       prompt.includes("[@role]"),
+    );
+    check(
+      "@everyone placeholder is rendered",
+      prompt.includes("[@everyone]"),
+    );
+    check(
+      "@here placeholder is rendered",
+      prompt.includes("[@here]"),
+    );
+    check(
+      "channel-link placeholder is rendered",
+      prompt.includes("[#channel]"),
     );
   }
 

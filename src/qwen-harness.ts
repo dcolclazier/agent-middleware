@@ -776,18 +776,29 @@ function applyRollingWindow(session: QwenSession): void {
  * format contract is one entry per line.
  *
  * Mention scrub: `transcribeIncoming` writes `message.content` raw, so live
- * `<@123>` / `<@!123>` / `<@&123>` tokens reach the prompt. Mirroring the
- * pattern at `bot-instance.ts:830-847`, we rewrite them to semantic
- * placeholders (`[@user]` / `[@role]`) — without discord.js mention
- * collections we cannot resolve to usernames here, but the pings are what
- * matter (a downstream LLM that learns to echo `<@123>` back to Discord
- * actually pings; `[@user]` does not).
+ * mention tokens reach the prompt. Mirroring the pattern at
+ * `bot-instance.ts:830-847` for users/roles, plus mass-ping and
+ * channel-link tokens that pattern doesn't cover. Bot reply paths
+ * (`sendOrAttach` / `sendWithFiles`) don't currently set
+ * `allowedMentions: { parse: [] }`, so a token Qwen echoes back becomes a
+ * live ping at send time. Defence at the renderer is the cheaper layer:
+ *
+ *   `<@123>` / `<@!123>`  → `[@user]`   user mention (would ping)
+ *   `<@&123>`             → `[@role]`   role mention (would ping)
+ *   `@everyone` / `@here` → `[@everyone]` / `[@here]`   mass-ping literals
+ *   `<#123>`              → `[#channel]` channel link (visual noise, no ping)
+ *
+ * Without discord.js mention collections we cannot resolve user/role IDs
+ * to usernames at this layer; killing the ping vector is the priority.
  */
 function sanitizeTranscriptText(text: string): string {
   return text
     .replace(/\r?\n/g, " ")
     .replace(/<@!?\d+>/g, "[@user]")
-    .replace(/<@&\d+>/g, "[@role]");
+    .replace(/<@&\d+>/g, "[@role]")
+    .replace(/@everyone/g, "[@everyone]")
+    .replace(/@here/g, "[@here]")
+    .replace(/<#\d+>/g, "[#channel]");
 }
 
 /**
