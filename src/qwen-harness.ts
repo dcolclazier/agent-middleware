@@ -42,6 +42,7 @@ import {
 import { estimateTokens } from "./token-estimate.js";
 import { loadPersona, getPersonaSync, type Persona } from "./qwen-persona.js";
 import {
+  awaitPendingWrites,
   readVerbatimWindow,
   searchProse,
   type TranscriptEntry,
@@ -1432,6 +1433,15 @@ export async function runQwenTurn(
     // field). When omitted, readVerbatimWindow falls back to "" and any
     // self-authored entries that may exist will pass through — only safe
     // for synthetic test channels with no historical Qwen entries.
+    //
+    // Drain pending channel-transcript writes before reading: bot-instance.ts
+    // fires `void transcribeIncoming(...)` for the inbound message that
+    // triggered this turn (and any peer-bot writes still settling). Without
+    // the barrier the read can race those writes and return a stale window
+    // that omits the just-said messages this feature exists to surface.
+    // The barrier is bounded by the channel's pending-write queue (~1 in
+    // steady state) and does not block the writer side.
+    await awaitPendingWrites(channelId);
     const verbatimWindow = await readVerbatimWindow(
       channelId,
       selfAuthor ?? "",
