@@ -46,8 +46,10 @@ The middleware that consumes this API lives in this repo (`src/mempalace-client.
 
 ### Initial deploy (one-time, already run)
 ```bash
+# Prerequisite: SSH key auth set up — `ssh spark2` works without password.
+# (Set up via ssh-keygen + ssh-copy-id; alias defined in ~/.ssh/config.)
+
 # from agent-middleware repo root:
-export SSH_PASS=...
 bash tools/mempalace/deploy-to-spark.sh
 
 # then from dcc repo root, to populate canon/facility_ai wings:
@@ -56,7 +58,7 @@ bash tools/mempalace/mine-training-data.sh
 
 ### Restart the API server
 ```bash
-sshpass -p "$SSH_PASS" ssh bender@192.168.1.8 '
+ssh spark2 '
 pkill -f "venv/bin/python.*api-server.py"
 cd ~/mempalace && nohup .venv/bin/python3 api-server.py >> api-server.log 2>&1 < /dev/null & disown
 '

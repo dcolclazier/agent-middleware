@@ -2,33 +2,30 @@
 # Deploy MemPalace HTTP API to Spark #2 (spark-45aa, 192.168.1.8)
 #
 # Prerequisites:
-#   - SSH access: sshpass -p "$SSH_PASS" ssh bender@192.168.1.8
+#   - SSH key auth: `ssh spark2` works without password (alias defined in ~/.ssh/config,
+#     identity at ~/.ssh/spark2). Set up once via:
+#       ssh-keygen -t ed25519 -f ~/.ssh/spark2 -N ''
+#       ssh-copy-id -i ~/.ssh/spark2.pub bender@192.168.1.8
 #   - Python 3.9+ on Spark
 #
 # Usage (run from agent-middleware repo root):
-#   export SSH_PASS=...
 #   bash tools/mempalace/deploy-to-spark.sh
 
 set -euo pipefail
 
-SPARK_HOST="192.168.1.8"
+SPARK_HOST="spark2"          # ~/.ssh/config alias → bender@192.168.1.8 with key auth
 SPARK_USER="bender"
 REMOTE_DIR="/home/$SPARK_USER/mempalace"
 PALACE_PATH="$REMOTE_DIR/palace"
 
-if [ -z "${SSH_PASS:-}" ]; then
-    echo "ERROR: SSH_PASS not set"
-    exit 1
-fi
-
-SSH="sshpass -p $SSH_PASS ssh -o StrictHostKeyChecking=no $SPARK_USER@$SPARK_HOST"
-SCP="sshpass -p $SSH_PASS scp -o StrictHostKeyChecking=no"
+SSH="ssh $SPARK_HOST"
+SCP="scp"
 
 echo "=== Step 1: Create directories on Spark ==="
 $SSH "mkdir -p $REMOTE_DIR/palace"
 
 echo "=== Step 2: Copy API server to Spark ==="
-$SCP tools/mempalace/api-server.py $SPARK_USER@$SPARK_HOST:$REMOTE_DIR/api-server.py
+$SCP tools/mempalace/api-server.py $SPARK_HOST:$REMOTE_DIR/api-server.py
 
 echo "=== Step 3: Install Python dependencies (venv) ==="
 $SSH "
@@ -100,12 +97,13 @@ $SSH "
 "
 
 echo "=== Step 7: Verify ==="
+SPARK_IP="192.168.1.8"   # http target — distinct from $SPARK_HOST (the SSH alias)
 echo -n "Health check: "
-curl -sf http://$SPARK_HOST:8100/health && echo "" || echo "FAILED — check logs on Spark"
+curl -sf http://$SPARK_IP:8100/health && echo "" || echo "FAILED — check logs on Spark"
 
 echo ""
 echo "=== Deploy complete ==="
-echo "MemPalace API running at http://$SPARK_HOST:8100"
+echo "MemPalace API running at http://$SPARK_IP:8100"
 echo ""
-echo "Verify status: curl http://$SPARK_HOST:8100/status"
+echo "Verify status: curl http://$SPARK_IP:8100/status"
 echo "Mine training data into canon/facility_ai wings: bash tools/mempalace/mine-training-data.sh (in dcc repo)"
