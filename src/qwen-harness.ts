@@ -912,6 +912,40 @@ function renderProseBlock(entries: TranscriptEntry[]): string {
 }
 
 /**
+ * Heuristic substring used to detect synthetic harness pushbacks pushed
+ * with `role: "user"`. Currently exactly one site (the text-only-gate
+ * canon-commit nudge in runQwenTurn). Centralised so the backfill
+ * helper and any future legacy-cleanup code stay in sync.
+ */
+const SYNTHETIC_PUSHBACK_PREFIX = "You produced a text-only response";
+
+/**
+ * If `session.humanUserMessages` is missing (legacy session persisted
+ * before this field existed), reconstruct it from `session.messages` by
+ * pulling every `role: "user"` entry except the known synthetic harness
+ * pushback. Idempotent — a no-op once the field is present.
+ *
+ * Why this matters: without backfill, the eager init at the runQwenTurn
+ * push site would set the field to `[]` on first encounter, then
+ * `buildLastUserMessagesQuery` would see only the current message and
+ * lose the prior-context buffer issue #7 was designed to preserve for
+ * short pivots ("ok"/"yes"). The fallback path in
+ * `buildLastUserMessagesQuery` exists as belt-and-braces for the case
+ * where someone calls it on a session that never went through
+ * runQwenTurn (e.g. read-only HTTP introspection paths).
+ */
+export function backfillHumanUserMessagesIfNeeded(session: QwenSession): void {
+  if (session.humanUserMessages) return;
+  session.humanUserMessages = [];
+  for (const m of session.messages) {
+    const msg = m as { role?: string; content?: unknown };
+    if (msg?.role !== "user" || typeof msg.content !== "string") continue;
+    if (msg.content.startsWith(SYNTHETIC_PUSHBACK_PREFIX)) continue;
+    session.humanUserMessages.push(msg.content);
+  }
+}
+
+/**
  * Build the search query used by the topical-decisions and topical-prose
  * searches in runQwenTurn. Returns the concatenation (joined by newlines)
  * of the last `n` HUMAN user messages in this session. If fewer than `n`
@@ -921,8 +955,11 @@ function renderProseBlock(entries: TranscriptEntry[]): string {
  * (e.g. the text-only-gate canon-commit nudge in runQwenTurn, which also
  * pushes `role: "user"`) don't pollute the retrieval query — that would
  * skew topical recall exactly when Qwen is already off-track. Falls back
- * to scanning `session.messages` when the field is absent (sessions
- * persisted before this field was added).
+ * to scanning `session.messages` when the field is absent (defensive
+ * guard for callers that bypass runQwenTurn's backfill — see
+ * `backfillHumanUserMessagesIfNeeded`). The fallback also skips the
+ * known synthetic pushback so it can't leak into the query through the
+ * legacy code path either.
  *
  * Buffers single-message conversational pivots ("ok", "yes") against the
  * topical context they're responding to — see issue #7.
@@ -935,15 +972,16 @@ export function buildLastUserMessagesQuery(
   if (session.humanUserMessages) {
     return session.humanUserMessages.slice(-n).join("\n");
   }
-  // Backward-compat path: pre-humanUserMessages session JSON. Scan messages
-  // and accept the (small) risk of synthetic pushback inclusion until the
-  // session next sees a fresh user turn and migrates onto the new field.
+  // Backward-compat path: pre-humanUserMessages session JSON that bypassed
+  // runQwenTurn's backfill (e.g. read-only HTTP introspection on a legacy
+  // session). Mirror the backfill's synthetic-pushback skip so the legacy
+  // path also stays clean.
   const userTexts: string[] = [];
   for (const m of session.messages) {
     const msg = m as { role?: string; content?: unknown };
-    if (msg?.role === "user" && typeof msg.content === "string") {
-      userTexts.push(msg.content);
-    }
+    if (msg?.role !== "user" || typeof msg.content !== "string") continue;
+    if (msg.content.startsWith(SYNTHETIC_PUSHBACK_PREFIX)) continue;
+    userTexts.push(msg.content);
   }
   return userTexts.slice(-n).join("\n");
 }
@@ -1484,15 +1522,17 @@ export async function runQwenTurn(
     // `buildLastUserMessagesQuery` reads this for topical retrieval so
     // mid-loop middleware nudges don't skew the recall query. Lazily
     // initialise for sessions persisted before this field existed.
-    if (!session.humanUserMessages) session.humanUserMessages = [];
-    session.humanUserMessages.push(userMessage);
+    backfillHumanUserMessagesIfNeeded(session);
+    session.humanUserMessages!.push(userMessage);
     // Drop-oldest-on-write so this array can't grow indefinitely on
     // long-lived sessions. Mirrors ADR-0004's drop-oldest pattern for the
-    // channel transcript wing.
-    if (session.humanUserMessages.length > HUMAN_USER_MESSAGES_CAP) {
-      session.humanUserMessages.splice(
+    // channel transcript wing. Applied AFTER the backfill so a chatty
+    // legacy session with hundreds of historical user turns gets bounded
+    // to the cap before any of those entries are read.
+    if (session.humanUserMessages!.length > HUMAN_USER_MESSAGES_CAP) {
+      session.humanUserMessages!.splice(
         0,
-        session.humanUserMessages.length - HUMAN_USER_MESSAGES_CAP,
+        session.humanUserMessages!.length - HUMAN_USER_MESSAGES_CAP,
       );
     }
     session.currentTurn = 0;

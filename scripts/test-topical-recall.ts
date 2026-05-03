@@ -5,6 +5,7 @@
 // Run: npx tsx scripts/test-topical-recall.ts
 
 import {
+  backfillHumanUserMessagesIfNeeded,
   buildSystemPrompt,
   buildLastUserMessagesQuery,
   TOPICAL_DECISIONS_BUDGET,
@@ -114,9 +115,10 @@ async function main() {
   }
 
   // 1b. Legacy session JSON without `humanUserMessages` falls back to
-  // scanning `messages` (backward-compat path). Documents the trade-off:
-  // legacy sessions lose synthetic-exclusion until they next see a fresh
-  // human turn and migrate onto the new field.
+  // scanning `messages` (defensive path for callers that bypass
+  // runQwenTurn's backfill, e.g. read-only HTTP introspection). The
+  // fallback also skips the synthetic harness pushback so it can't leak
+  // through the legacy code path.
   sect("1b. legacy session (no humanUserMessages) falls back to messages scan");
   {
     const legacy: QwenSession = {
@@ -126,6 +128,13 @@ async function main() {
         { role: "user", content: "legacy msg one" },
         { role: "assistant", content: "reply" },
         { role: "user", content: "legacy msg two" },
+        // Synthetic harness pushback in the legacy stream — must NOT leak
+        // through the legacy fallback either.
+        {
+          role: "user",
+          content:
+            "You produced a text-only response but the task asked for canon work and you did not call canon_commit. Commit your work now or call task_complete with an explanation.",
+        },
       ],
       taskState: "idle",
       currentTurn: 0,
@@ -137,8 +146,83 @@ async function main() {
     };
     const q = buildLastUserMessagesQuery(legacy, 3);
     check(
-      "legacy session falls back to scanning messages and joins user entries",
+      "legacy fallback joins real user entries in arrival order",
       q === "legacy msg one\nlegacy msg two",
+      `got: ${JSON.stringify(q)}`,
+    );
+    check(
+      "synthetic pushback is excluded from the legacy fallback path",
+      !q.includes("Commit your work now"),
+    );
+  }
+
+  // 1c. backfillHumanUserMessagesIfNeeded — preserves issue #7's pivot
+  // context for legacy sessions on first post-upgrade turn. Without this,
+  // a legacy session that loaded with `humanUserMessages: undefined` and
+  // had the field eagerly initialised at the runQwenTurn push site would
+  // see only the current message in the topical query — losing the
+  // prior-context buffer for short follow-ups ("ok"/"yes").
+  sect("1c. backfillHumanUserMessagesIfNeeded — legacy → migrated");
+  {
+    const legacy: QwenSession = {
+      id: "legacy-needing-backfill",
+      channelId: "x",
+      messages: [
+        { role: "user", content: "Let's plan goblin season three." },
+        { role: "assistant", content: "Sounds good." },
+        { role: "user", content: "Lean into the swarm angle." },
+        { role: "assistant", content: "Got it." },
+        // Synthetic harness pushback — must be skipped during backfill.
+        {
+          role: "user",
+          content:
+            "You produced a text-only response but the task asked for canon work and you did not call canon_commit. Commit your work now or call task_complete with an explanation.",
+        },
+        { role: "assistant", content: "Apologies, committing." },
+      ],
+      taskState: "idle",
+      currentTurn: 0,
+      toolFailures: {},
+      hadCommitDuringThisTask: false,
+      lastUserMessageRequestedCanon: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    backfillHumanUserMessagesIfNeeded(legacy);
+    check(
+      "backfill populates humanUserMessages with all real user entries",
+      legacy.humanUserMessages?.length === 2,
+      `got ${legacy.humanUserMessages?.length}`,
+    );
+    check(
+      "backfill skips the synthetic harness pushback",
+      !legacy.humanUserMessages?.some((m) =>
+        m.startsWith("You produced a text-only response"),
+      ),
+    );
+    // Idempotent — calling again should not re-scan.
+    legacy.humanUserMessages!.push("manually-added");
+    backfillHumanUserMessagesIfNeeded(legacy);
+    check(
+      "backfill is idempotent (no-op when field is already present)",
+      legacy.humanUserMessages?.length === 3,
+      `got ${legacy.humanUserMessages?.length}`,
+    );
+    // After backfill, query reflects the migration — pivot like "ok"
+    // following the backfilled context preserves issue #7's behavior.
+    const sessionWithPivot: QwenSession = {
+      ...legacy,
+      humanUserMessages: undefined as unknown as string[] | undefined,
+    };
+    sessionWithPivot.humanUserMessages = undefined;
+    backfillHumanUserMessagesIfNeeded(sessionWithPivot);
+    sessionWithPivot.humanUserMessages!.push("ok");
+    const q = buildLastUserMessagesQuery(sessionWithPivot, 3);
+    check(
+      "post-backfill query buffers 'ok' against the prior 2 real turns",
+      q.includes("goblin season three") &&
+        q.includes("swarm angle") &&
+        q.endsWith("ok"),
       `got: ${JSON.stringify(q)}`,
     );
   }
